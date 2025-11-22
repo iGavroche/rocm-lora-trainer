@@ -1,0 +1,21 @@
+---
+description: Code quality standards and practices
+alwaysApply: true
+---
+
+# Code Quality
+
+## Testing
+- Write tests that fail first, then fix the code
+- Test edge cases: zeros, Inf, NaN, extreme values
+- Verify fixes work with real data, not just test data
+
+## Documentation
+- **DO NOT create .md files unless explicitly requested by user**
+- Focus on fixing code, not documenting
+- Only create documentation when user explicitly asks
+
+## Focus
+- Focus on fixing, not documenting
+- Test everything analytically
+- When you think something "should" work, write a test instead

@@ -1,4 +1,5 @@
 import argparse
+import random
 from typing import List, Optional
 from PIL import Image
 
@@ -485,6 +486,14 @@ class WanNetworkTrainer(NetworkTrainer):
 
         if self.high_low_training:
             # load high noise model
+            # Temporarily move low noise model to CPU to free GPU memory for loading high noise model
+            logger.info(f"Temporarily moving low noise model to CPU to free GPU memory for high noise model loading")
+            model = model.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            
             logger.info(f"Loading high noise model from {self.dit_high_noise_path}")
             model_high_noise = load_wan_model(
                 self.config,
@@ -492,11 +501,22 @@ class WanNetworkTrainer(NetworkTrainer):
                 self.dit_high_noise_path,
                 attn_mode,
                 split_attn,
-                "cpu" if args.offload_inactive_dit else loading_device,
+                "cpu",  # Always load to CPU first to save GPU memory
                 dit_weight_dtype,
                 args.fp8_scaled,
                 disable_numpy_memmap=args.disable_numpy_memmap,
             )
+            
+            # Move low noise model back to target device
+            logger.info(f"Moving low noise model back to {loading_device}")
+            model = model.to(loading_device)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Move to target device after conversion if not using CPU offloading
+            if not args.offload_inactive_dit and loading_device.type != "cpu":
+                logger.info(f"Moving high noise model to {loading_device} after dtype conversion")
+                model_high_noise = model_high_noise.to(loading_device)
             if args.force_v2_1_time_embedding:
                 model_high_noise.set_time_embedding_v2_1(True)
             if self.blocks_to_swap > 0:
@@ -538,38 +558,48 @@ class WanNetworkTrainer(NetworkTrainer):
             return super().get_noisy_model_input_and_timesteps(args, noise, latents, timesteps, noise_scheduler, device, dtype)
 
         # high-low training case
-        # call super to get the noisy model input and timesteps, and sample only the first one, and choose the model we want based on the timestep
-        noisy_model_input, sample_timesteps = super().get_noisy_model_input_and_timesteps(
-            args, noise[0:1], latents[0:1], timesteps[0:1] if timesteps is not None else None, noise_scheduler, device, dtype
-        )
-        high_noise = sample_timesteps[0] / 1000.0 >= self.timestep_boundary
+        # Check that we're using a compatible timestep_sampling method
+        if args.timestep_sampling == "sigma":
+            logger.warning(
+                "timestep_sampling='sigma' is not compatible with high/low noise training. "
+                "Falling back to original method. Please use --timestep_sampling uniform (or similar)."
+            )
+            return super().get_noisy_model_input_and_timesteps(args, noise, latents, timesteps, noise_scheduler, device, dtype)
+        
+        # Sample a random timestep to determine high/low noise for this batch
+        # We compute directly to avoid parent class issues with 0.0 timesteps
+        ts_normalized = random.uniform(0.0, 1.0)
+        high_noise = ts_normalized >= self.timestep_boundary
         self.next_model_is_high_noise = high_noise
-
+        
         # choose each member of latents for high or low noise model. because we want to train all the latents
-        num_max_calls = 100
+        # Compute timesteps and noisy inputs directly to avoid parent class issues with 0.0 timesteps
         final_noisy_model_inputs = []
         final_timesteps_list = []
         bsize = latents.shape[0]
+        
         for i in range(bsize):
-            for _ in range(num_max_calls):
-                ts_i = [self.get_bucketed_timestep()] if self.num_timestep_buckets is not None else None
-
-                noisy_model_input, ts_i = super().get_noisy_model_input_and_timesteps(
-                    args, noise[i : i + 1], latents[i : i + 1], ts_i, noise_scheduler, device, dtype
-                )
-                if (high_noise and ts_i[0] / 1000.0 >= self.timestep_boundary) or (
-                    not high_noise and ts_i[0] / 1000.0 < self.timestep_boundary
-                ):
-                    final_noisy_model_inputs.append(noisy_model_input)
-                    final_timesteps_list.append(ts_i)
-                    break
-
-        if len(final_noisy_model_inputs) < bsize:
-            logger.warning(
-                f"No valid noisy model inputs found for bsize={bsize}, high_noise={high_noise}, timestep_boundary={self.timestep_boundary}"
-            )
-            # fall back to the original method
-            return super().get_noisy_model_input_and_timesteps(args, noise, latents, timesteps, noise_scheduler, device, dtype)
+            # Sample timestep directly in the correct range for high/low noise
+            if high_noise:
+                ts_normalized = random.uniform(self.timestep_boundary, 1.0)
+            else:
+                ts_normalized = random.uniform(0.0, self.timestep_boundary)
+            
+            # Convert to [1, 1001] range (parent class adds 1, so we match that format)
+            ts_val = ts_normalized * 1000.0 + 1.0
+            ts_i = torch.tensor([ts_val], device=device, dtype=torch.float32)
+            
+            # Compute noisy model input directly using flow matching formula
+            # Parent class uses: noisy_model_input = (1 - t) * latents + t * noise
+            # where t is normalized [0, 1]
+            t = torch.tensor([ts_normalized], device=device, dtype=dtype)
+            t = t.view(-1, 1, 1, 1, 1) if latents.ndim == 5 else t.view(-1, 1, 1, 1)
+            latents_i = latents[i : i + 1].to(device=device, dtype=dtype)
+            noise_i = noise[i : i + 1].to(device=device, dtype=dtype)
+            noisy_model_input = (1 - t) * latents_i + t * noise_i
+            
+            final_noisy_model_inputs.append(noisy_model_input)
+            final_timesteps_list.append(ts_i)
 
         # final noisy model input may have less than bsize elements, it will be fine for training
         final_noisy_model_input = torch.cat(final_noisy_model_inputs, dim=0)
@@ -658,7 +688,19 @@ class WanNetworkTrainer(NetworkTrainer):
         clip_fea = None
         if self.i2v_training:
             image_latents = batch["latents_image"]
-            image_latents = image_latents.to(device=accelerator.device, dtype=network_dtype)
+            # image_latents must match model dtype (dit_dtype), not network_dtype, because it's concatenated with model input
+            model_dtype = transformer.dtype if hasattr(transformer, 'dtype') else self.dit_dtype
+            
+            # Clamp inf/nan values to prevent numerical instability (silently fix corrupted cached latents)
+            # Check before converting to float8, as float8 doesn't support isinf/isnan
+            image_latents_check = image_latents.to(device=accelerator.device, dtype=torch.float32)
+            if torch.isinf(image_latents_check).any() or torch.isnan(image_latents_check).any():
+                # Clamp to reasonable range (VAE latents are typically in [-10, 10] range)
+                image_latents_check = torch.clamp(image_latents_check, min=-10.0, max=10.0)
+                image_latents_check = torch.nan_to_num(image_latents_check, nan=0.0, posinf=10.0, neginf=-10.0)
+                image_latents = image_latents_check.to(dtype=model_dtype)
+            else:
+                image_latents = image_latents.to(device=accelerator.device, dtype=model_dtype)
 
             if not self.config.v2_2:
                 clip_fea = batch["clip"]
@@ -672,10 +714,23 @@ class WanNetworkTrainer(NetworkTrainer):
 
         if self.control_training:
             control_latents = batch["latents_control"]
-            control_latents = control_latents.to(device=accelerator.device, dtype=network_dtype)
+            # control_latents and image_latents must match model dtype when concatenated
+            model_dtype = transformer.dtype if hasattr(transformer, 'dtype') else self.dit_dtype
+            
+            # Clamp inf/nan values in control_latents (silently fix corrupted cached latents)
+            # Check before converting to float8, as float8 doesn't support isinf/isnan
+            control_latents_check = control_latents.to(device=accelerator.device, dtype=torch.float32)
+            if torch.isinf(control_latents_check).any() or torch.isnan(control_latents_check).any():
+                control_latents_check = torch.clamp(control_latents_check, min=-10.0, max=10.0)
+                control_latents_check = torch.nan_to_num(control_latents_check, nan=0.0, posinf=10.0, neginf=-10.0)
+                control_latents = control_latents_check.to(dtype=model_dtype)
+            else:
+                control_latents = control_latents.to(device=accelerator.device, dtype=model_dtype)
+            
             if image_latents is not None:
                 image_latents = image_latents[:, 4:]  # remove mask for Wan2.1-Fun-Control
                 image_latents[:, :, 1:] = 0  # remove except the first frame
+                image_latents = image_latents.to(dtype=model_dtype)  # ensure dtype matches
             else:
                 image_latents = torch.zeros_like(control_latents)  # B, C, F, H, W
             image_latents = torch.concat([control_latents, image_latents], dim=1)  # B, C, F, H, W
@@ -698,12 +753,80 @@ class WanNetworkTrainer(NetworkTrainer):
         seq_len = lat_f * lat_h * lat_w // (self.config.patch_size[0] * self.config.patch_size[1] * self.config.patch_size[2])
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
         noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=network_dtype)
+        
+        # Final check for NaN/Inf in image_latents before model call (I2V specific)
+        # This should rarely trigger since we clamp earlier, but serves as a safety net
+        # Check in float32 first, as float8 doesn't support isinf/isnan
+        if image_latents is not None:
+            image_latents_check = image_latents.to(dtype=torch.float32) if image_latents.dtype != torch.float32 else image_latents
+            if torch.isnan(image_latents_check).any() or torch.isinf(image_latents_check).any():
+                # Clamp to reasonable range for VAE latents
+                image_latents_check = torch.clamp(image_latents_check, min=-10.0, max=10.0)
+                image_latents_check = torch.nan_to_num(image_latents_check, nan=0.0, posinf=10.0, neginf=-10.0)
+                # Convert back to original dtype
+                if image_latents.dtype != torch.float32:
+                    image_latents = image_latents_check.to(dtype=image_latents.dtype)
+                else:
+                    image_latents = image_latents_check
+            
+            # Convert image_latents to network_dtype to match noisy_model_input before concatenation
+            # Float8 cannot be promoted with other types, so we must match dtypes
+            image_latents = image_latents.to(device=accelerator.device, dtype=network_dtype)
+        
+        # Debug: Check if model is in training mode
+        if not model.training:
+            logger.warning(f"Model is in eval mode! This may cause issues. Setting to training mode.")
+            model.train()
+        
         with accelerator.autocast():
             model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
         model_pred = torch.stack(model_pred, dim=0)  # list to tensor
+        
+        # Debug: Log model_pred immediately after forward pass
+        if not hasattr(self, '_debug_step_count'):
+            self._debug_step_count = 0
+        self._debug_step_count += 1
+        
+        # Log first 10 steps and every 50 steps
+        if self._debug_step_count <= 10 or self._debug_step_count % 50 == 0:
+            logger.info(f"DEBUG Step {self._debug_step_count}: model_pred after forward - shape={model_pred.shape}, dtype={model_pred.dtype}, min={model_pred.min().item():.6f}, max={model_pred.max().item():.6f}, mean={model_pred.mean().item():.6f}")
+            if model_pred.abs().max().item() < 1e-6:
+                logger.error(f"CRITICAL Step {self._debug_step_count}: model_pred is all zeros!")
+        
+        # Check for NaN in model_pred (should not happen with clamped latents, but log if it does)
+        if torch.isnan(model_pred).any():
+            logger.error(f"NaN detected in model_pred! This should not happen with clamped latents. Shape: {model_pred.shape}, dtype: {model_pred.dtype}")
+            # Don't replace NaN here - let it propagate so training stops
 
         # flow matching loss
         target = noise - latents
+        
+        # Debug: Check noise and latents before computing target
+        if self._debug_step_count <= 10 or self._debug_step_count % 50 == 0:
+            logger.info(f"DEBUG Step {self._debug_step_count}: noise stats in _call_dit - shape={noise.shape}, dtype={noise.dtype}, min={noise.min().item():.6f}, max={noise.max().item():.6f}, mean={noise.mean().item():.6f}")
+            logger.info(f"DEBUG Step {self._debug_step_count}: latents stats in _call_dit - shape={latents.shape}, dtype={latents.dtype}, min={latents.min().item():.6f}, max={latents.max().item():.6f}, mean={latents.mean().item():.6f}")
+            if latents.abs().max().item() < 1e-6:
+                logger.error(f"CRITICAL Step {self._debug_step_count}: latents are all zeros in _call_dit!")
+        
+        # Debug: Check if model_pred equals target (which would cause zero loss)
+        # This should never happen unless the model is broken or not training
+        max_diff = (model_pred - target).abs().max().item()
+        mean_diff = (model_pred - target).abs().mean().item()
+        
+        if self._debug_step_count <= 10 or self._debug_step_count % 50 == 0:
+            logger.info(f"DEBUG Step {self._debug_step_count}: target stats - shape={target.shape}, dtype={target.dtype}, min={target.min().item():.6f}, max={target.max().item():.6f}, mean={target.mean().item():.6f}")
+            logger.info(f"DEBUG Step {self._debug_step_count}: model_pred vs target - max_diff={max_diff:.9f}, mean_diff={mean_diff:.9f}")
+            if target.abs().max().item() < 1e-6:
+                logger.error(f"CRITICAL Step {self._debug_step_count}: target is all zeros!")
+        
+        if torch.allclose(model_pred, target, atol=1e-6, rtol=1e-6):
+            logger.error(f"CRITICAL: model_pred is identical to target! This means the model is not learning.")
+            logger.error(f"  model_pred shape: {model_pred.shape}, dtype: {model_pred.dtype}")
+            logger.error(f"  target shape: {target.shape}, dtype: {target.dtype}")
+            logger.error(f"  model_pred stats: min={model_pred.min().item():.6f}, max={model_pred.max().item():.6f}, mean={model_pred.mean().item():.6f}")
+            logger.error(f"  target stats: min={target.min().item():.6f}, max={target.max().item():.6f}, mean={target.mean().item():.6f}")
+            logger.error(f"  noisy_model_input stats: min={noisy_model_input.min().item():.6f}, max={noisy_model_input.max().item():.6f}, mean={noisy_model_input.mean().item():.6f}")
+            logger.error(f"  This likely means the model is not being trained or LoRA weights are not being applied correctly.")
 
         return model_pred, target
 

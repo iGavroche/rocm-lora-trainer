@@ -39,11 +39,60 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
         item = batch[0]  # other items should have the same size
         raise ValueError(f"Image or video size too small: {item.item_key} and {len(batch) - 1} more, size: {item.original_size}")
 
-    # print(f"encode batch: {contents.shape}")
-    with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
-        latent = vae.encode(contents)  # list of Tensor[C, F, H, W]
+    # DEBUG: Check input to VAE
+    contents_max = contents.abs().max().item()
+    contents_mean = contents.abs().mean().item()
+    logger.info(f"VAE input - shape={contents.shape}, dtype={contents.dtype}, max={contents_max:.6e}, mean={contents_mean:.6e}")
+    if contents_max < 1e-6:
+        logger.error(f"CRITICAL: VAE input is all zeros! This means preprocessing failed.")
+        raise RuntimeError(f"VAE input is all zeros - preprocessing failed")
+    
+    # CRITICAL: ROCm workaround - disable autocast for VAE encoding
+    # Autocast can cause numerical issues on ROCm that lead to zeros
+    is_rocm = torch.version.hip is not None if hasattr(torch.version, 'hip') else False
+    if is_rocm:
+        logger.info("ROCm detected: Disabling autocast for VAE encoding to avoid numerical issues")
+        with torch.no_grad():
+            latent = vae.encode(contents)  # list of Tensor[C, F, H, W]
+    else:
+        # print(f"encode batch: {contents.shape}")
+        with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
+            latent = vae.encode(contents)  # list of Tensor[C, F, H, W]
     latent = torch.stack(latent, dim=0)  # B, C, F, H, W
-    latent = latent.to(vae.dtype)  # convert to bfloat16, we are not sure if this is correct
+    
+    # DEBUG: Check VAE output before clamping
+    latent_f32_before = latent.float() if latent.dtype != torch.float32 else latent
+    max_val_before = latent_f32_before.abs().max().item()
+    mean_val_before = latent_f32_before.abs().mean().item()
+    logger.info(f"VAE encode output - shape={latent.shape}, dtype={latent.dtype}, max={max_val_before:.6e}, mean={mean_val_before:.6e}")
+    
+    # CRITICAL: Check if VAE output is all zeros
+    if max_val_before < 1e-6:
+        logger.error(f"CRITICAL: VAE encode produced all zeros! This indicates VAE encoding failed.")
+        raise RuntimeError(f"VAE encode produced all zeros - VAE encoding failed or input was invalid")
+    
+    # CRITICAL: Clamp before dtype conversion to prevent ROCm bfloat16 conversion bug
+    # Convert to float32 first for accurate clamping
+    latent_f32 = latent_f32_before
+    if max_val_before > 10.0 or torch.isinf(latent_f32).any() or torch.isnan(latent_f32).any():
+        logger.warning(f"Clamping extreme values from VAE: max={max_val_before:.6e}")
+    latent_f32 = torch.clamp(latent_f32, min=-10.0, max=10.0)
+    latent_f32 = torch.nan_to_num(latent_f32, nan=0.0, posinf=10.0, neginf=-10.0)
+    
+    # Verify clamping worked
+    max_val_after = latent_f32.abs().max().item()
+    if max_val_after > 10.0:
+        logger.error(f"CRITICAL: Clamping failed! max_val_after={max_val_after:.6e}")
+        raise RuntimeError(f"Clamping failed: max_val_before={max_val_before:.6e}, max_val_after={max_val_after:.6e}")
+    
+    # Now convert to target dtype
+    latent = latent_f32.to(vae.dtype)
+    
+    # DEBUG: Check after dtype conversion
+    max_val_final = latent.float().abs().max().item()
+    if max_val_final < 1e-6 and max_val_after > 1e-6:
+        logger.error(f"CRITICAL: dtype conversion to {vae.dtype} produced zeros! max_val_after={max_val_after:.6e}, max_val_final={max_val_final:.6e}")
+        raise RuntimeError(f"dtype conversion to {vae.dtype} produced zeros (ROCm bug)")
 
     if i2v:
         # extract first frame of contents
@@ -71,12 +120,23 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
         # Zero padding for the required number of frames only
         padding_frames = F - 1  # The first frame is the input image
         images_resized = torch.concat([images, torch.zeros(B, 3, padding_frames, h, w, device=vae.device)], dim=2)
-        with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
-            y = vae.encode(images_resized)
+        # CRITICAL: ROCm workaround - disable autocast for VAE encoding
+        if is_rocm:
+            with torch.no_grad():
+                y = vae.encode(images_resized)
+        else:
+            with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
+                y = vae.encode(images_resized)
         y = torch.stack(y, dim=0)  # B, C, F, H, W
 
         y = y[:, :, :F]  # may be not needed
-        y = y.to(vae.dtype)  # convert to bfloat16
+        
+        # CRITICAL: Clamp before dtype conversion to prevent ROCm bfloat16 conversion bug
+        y_f32 = y.float() if y.dtype != torch.float32 else y
+        y_f32 = torch.clamp(y_f32, min=-10.0, max=10.0)
+        y_f32 = torch.nan_to_num(y_f32, nan=0.0, posinf=10.0, neginf=-10.0)
+        y = y_f32.to(vae.dtype)
+        
         y = torch.concat([msk, y], dim=1)  # B, 4 + C, F, H, W
 
     else:
@@ -99,10 +159,20 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
         control_contents = control_contents.permute(0, 4, 1, 2, 3).contiguous()  # B, C, F, H, W
         control_contents = control_contents.to(vae.device, dtype=vae.dtype)
         control_contents = control_contents / 127.5 - 1.0  # normalize to [-1, 1]
-        with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
-            control_latent = vae.encode(control_contents)  # list of Tensor[C, F, H, W]
+        # CRITICAL: ROCm workaround - disable autocast for VAE encoding
+        if is_rocm:
+            with torch.no_grad():
+                control_latent = vae.encode(control_contents)  # list of Tensor[C, F, H, W]
+        else:
+            with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
+                control_latent = vae.encode(control_contents)  # list of Tensor[C, F, H, W]
         control_latent = torch.stack(control_latent, dim=0)  # B, C, F, H, W
-        control_latent = control_latent.to(vae.dtype)  # convert to bfloat16
+        
+        # CRITICAL: Clamp before dtype conversion to prevent ROCm bfloat16 conversion bug
+        control_latent_f32 = control_latent.float() if control_latent.dtype != torch.float32 else control_latent
+        control_latent_f32 = torch.clamp(control_latent_f32, min=-10.0, max=10.0)
+        control_latent_f32 = torch.nan_to_num(control_latent_f32, nan=0.0, posinf=10.0, neginf=-10.0)
+        control_latent = control_latent_f32.to(vae.dtype)
     else:
         control_latent = None
 
@@ -124,6 +194,15 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
         l = latent[i]
         cctx = clip_context[i] if clip is not None else None
         y_i = y[i] if i2v else None
+        # CRITICAL: Clamp image latents (y_i[4:]) before saving to prevent extreme values
+        if y_i is not None:
+            # Extract image latents (channels 4 onwards) and clamp them
+            image_latent_part = y_i[4:]  # [C, F, H, W]
+            image_latent_f32 = image_latent_part.float() if image_latent_part.dtype != torch.float32 else image_latent_part
+            image_latent_f32 = torch.clamp(image_latent_f32, min=-10.0, max=10.0)
+            image_latent_f32 = torch.nan_to_num(image_latent_f32, nan=0.0, posinf=10.0, neginf=-10.0)
+            # Put clamped values back into y_i
+            y_i[4:] = image_latent_f32.to(y_i.dtype)
         control_latent_i = control_latent[i] if control_latent is not None else None
         # print(f"save latent cache: {item.latent_cache_path}, latent shape: {l.shape}")
         save_latent_cache_wan(item, l, cctx, y_i, control_latent_i)
@@ -253,7 +332,18 @@ def main():
     vae_path = args.vae
 
     logger.info(f"Loading VAE model from {vae_path}")
-    vae_dtype = torch.bfloat16 if args.vae_dtype is None else str_to_dtype(args.vae_dtype)
+    # CRITICAL: ROCm has issues with bfloat16 in VAE - use float32 instead
+    is_rocm = torch.version.hip is not None if hasattr(torch.version, 'hip') else False
+    if args.vae_dtype is None:
+        if is_rocm:
+            logger.info("ROCm detected: Using float32 for VAE instead of bfloat16 to avoid ROCm bfloat16 bugs")
+            vae_dtype = torch.float32
+        else:
+            vae_dtype = torch.bfloat16
+    else:
+        vae_dtype = str_to_dtype(args.vae_dtype)
+        if is_rocm and vae_dtype == torch.bfloat16:
+            logger.warning("ROCm detected: bfloat16 may cause VAE encoding to produce zeros. Consider using float32.")
     cache_device = torch.device("cpu") if args.vae_cache_cpu else None
     vae = WanVAE(vae_path=vae_path, device=device, dtype=vae_dtype, cache_device=cache_device)
 

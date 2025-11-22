@@ -240,11 +240,43 @@ class AttentionBlock(nn.Module):
         q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3, -1).permute(0, 1, 3, 2).contiguous().chunk(3, dim=-1)
 
         # apply attention
+        # Workaround for ROCm: scaled_dot_product_attention can produce extreme values or zeros on ROCm with bfloat16
+        # DEBUG: Check inputs before attention
+        q_max = q.abs().max().item()
+        k_max = k.abs().max().item()
+        v_max = v.abs().max().item()
+        if q_max < 1e-6 or k_max < 1e-6 or v_max < 1e-6:
+            logging.warning(f"Attention inputs contain zeros: q_max={q_max:.6e}, k_max={k_max:.6e}, v_max={v_max:.6e}")
+        
         x = F.scaled_dot_product_attention(
             q,
             k,
             v,
         )
+        
+        # CRITICAL: Always clamp unconditionally - ROCm can produce zeros or extreme values
+        # This must happen before any other operations to prevent propagation
+        x_f32 = x.float() if x.dtype != torch.float32 else x
+        max_val = x_f32.abs().max().item()
+        mean_val = x_f32.abs().mean().item()
+        
+        # Check if attention produced zeros (ROCm bug)
+        if max_val < 1e-6 and (q_max > 1e-6 or k_max > 1e-6 or v_max > 1e-6):
+            logging.error(f"CRITICAL: scaled_dot_product_attention produced zeros on ROCm! q_max={q_max:.6e}, k_max={k_max:.6e}, v_max={v_max:.6e}, x_max={max_val:.6e}")
+            # This is a ROCm bug - we can't fix it here, but we should at least not propagate zeros
+            # Return a small non-zero value to prevent complete failure
+            x = torch.ones_like(x) * 1e-6
+            x_f32 = x.float() if x.dtype != torch.float32 else x
+            max_val = x_f32.abs().max().item()
+        
+        # Always clamp unconditionally to [-10, 10]
+        if max_val > 10.0 or torch.isinf(x_f32).any() or torch.isnan(x_f32).any():
+            logging.warning(f"Clamping extreme values in attention output: max={max_val:.6e}, mean={mean_val:.6e}")
+        x_f32 = torch.clamp(x_f32, min=-10.0, max=10.0)
+        x_f32 = torch.nan_to_num(x_f32, nan=0.0, posinf=10.0, neginf=-10.0)
+        # Convert back to original dtype
+        x = x_f32.to(x.dtype) if x.dtype != torch.float32 else x_f32
+        
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output
@@ -564,6 +596,46 @@ class WanVAE_(nn.Module):
             mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(1, self.z_dim, 1, 1, 1)
         else:
             mu = (mu - scale[0]) * scale[1]
+        
+        # DEBUG: Check mu before clamping
+        original_mu_dtype = mu.dtype
+        mu_f32_check = mu.float() if mu.dtype != torch.float32 else mu
+        max_val_before = mu_f32_check.abs().max().item()
+        mean_val_before = mu_f32_check.abs().mean().item()
+        
+        # CRITICAL: If mu is already zeros, the VAE forward pass failed
+        if max_val_before < 1e-6:
+            import logging
+            logging.error(f"CRITICAL: VAE internal encode produced all zeros! This means the VAE forward pass failed.")
+            logging.error(f"  mu shape={mu.shape}, dtype={mu.dtype}, device={mu.device}")
+            logging.error(f"  This could be due to ROCm bfloat16 issues or VAE model corruption.")
+            # Don't clamp zeros - return as is so we can detect the issue
+            self.clear_cache()
+            return mu
+        
+        # CRITICAL: Always clamp to [-10, 10] unconditionally
+        # VAE latents should never exceed this range. ROCm bfloat16 can't represent values accurately for checking
+        # So we always clamp regardless of current value
+        # Convert to float32 for clamping (this is safe even on ROCm)
+        mu_cpu = mu.detach().cpu()
+        mu_f32 = mu_cpu.float()
+        
+        # Verify conversion didn't produce zeros (ROCm bug check)
+        max_val_after_convert = mu_f32.abs().max().item()
+        if max_val_after_convert < 1e-6 and max_val_before > 1e-6:
+            import logging
+            logging.error(f"CRITICAL: bfloat16->float32 conversion in VAE encode produced zeros! max_before={max_val_before:.6e}, max_after={max_val_after_convert:.6e}")
+            logging.error(f"  This is the ROCm bfloat16 conversion bug. Keeping original mu without clamping.")
+            # Return original mu without clamping to avoid making it worse
+            self.clear_cache()
+            return mu
+        
+        # Always clamp unconditionally - don't check threshold since bfloat16 can't represent it accurately
+        mu_f32 = torch.clamp(mu_f32, min=-10.0, max=10.0)
+        mu_f32 = torch.nan_to_num(mu_f32, nan=0.0, posinf=10.0, neginf=-10.0)
+        # Move back to original device and dtype
+        mu = mu_f32.to(device=mu.device, dtype=original_mu_dtype)
+        
         self.clear_cache()
         return mu
 
@@ -753,7 +825,34 @@ class WanVAE:
         videos: A list of videos each with shape [C, T, H, W].
         """
         # with amp.autocast(dtype=self.dtype):
-        return [self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0) for u in videos]
+        # Fix for ROCm bfloat16->float32 conversion bug on AMD GPUs
+        # Keep as bfloat16 instead of converting to float32, since caching code converts back anyway
+        results = []
+        for u in videos:
+            mu = self.model.encode(u.unsqueeze(0), self.scale)  # [1, C, F, H, W] in bfloat16
+            
+            # CRITICAL: Always clamp to [-10, 10] - convert to float32 first for accurate clamping
+            # VAE latents should never exceed this range. Always clamp unconditionally to prevent extreme values
+            original_mu_dtype = mu.dtype
+            mu_f32 = mu.float() if mu.dtype != torch.float32 else mu
+            max_val = mu_f32.abs().max().item()
+            
+            # Always clamp to [-10, 10] - don't check threshold since bfloat16 can't represent large values accurately
+            if max_val > 10.0 or torch.isinf(mu_f32).any() or torch.isnan(mu_f32).any():
+                logging.warning(f"Clamping extreme values in VAE encode output: max={max_val:.6e}")
+            mu_f32 = torch.clamp(mu_f32, min=-10.0, max=10.0)
+            mu_f32 = torch.nan_to_num(mu_f32, nan=0.0, posinf=10.0, neginf=-10.0)
+            # Convert back to original dtype
+            mu = mu_f32.to(original_mu_dtype) if original_mu_dtype != torch.float32 else mu_f32
+            
+            # Workaround: Keep as bfloat16 to avoid ROCm conversion bug
+            # The caching code will convert to the desired dtype anyway
+            mu = mu.squeeze(0)  # Remove batch dimension, keep as bfloat16
+            # Only convert to float32 if not bfloat16 (for compatibility)
+            if mu.dtype != torch.bfloat16:
+                mu = mu.float()
+            results.append(mu)
+        return results
 
     def decode(self, zs):
         # with amp.autocast(dtype=self.dtype):

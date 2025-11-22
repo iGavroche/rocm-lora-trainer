@@ -23,12 +23,8 @@ try:
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
 
-try:
-    import xformers.ops as xops
-
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    XFORMERS_AVAILABLE = False
+# Disable xformers to avoid compatibility issues
+XFORMERS_AVAILABLE = False
 
 
 import warnings
@@ -140,27 +136,30 @@ def flash_attention(
         del q, k, v
         return x.type(out_dtype)
 
-    # xformers
+    # xformers (fallback to PyTorch SDPA)
     if attn_mode == "xformers":
-        assert not deterministic, "deterministic is not supported in xformers."
-        assert not causal, "causal is not supported in xformers."
+        warnings.warn("xformers is disabled, falling back to PyTorch scaled_dot_product_attention")
+        # Fall back to PyTorch's scaled_dot_product_attention
         if q_scale is not None:
             q = q * q_scale
-        q = half(q)
-        k = half(k)
-        v = half(v)
+        q = half(q.transpose(1, 2))
+        k = half(k.transpose(1, 2))
+        v = half(v.transpose(1, 2))
 
         if not split_attn:
-            q = xops.memory_efficient_attention(q, k, v, p=dropout_p, scale=softmax_scale)
+            q = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=causal, dropout_p=dropout_p, scale=softmax_scale
+            )
             x = q
         else:
             x = torch.empty_like(q)
             for i in range(q.size(0)):
-                x[i : i + 1] = xops.memory_efficient_attention(
-                    q[i : i + 1], k[i : i + 1], v[i : i + 1], p=dropout_p, scale=softmax_scale
+                x[i : i + 1] = torch.nn.functional.scaled_dot_product_attention(
+                    q[i : i + 1], k[i : i + 1], v[i : i + 1], is_causal=causal, dropout_p=dropout_p, scale=softmax_scale
                 )
 
         del q, k, v
+        x = x.transpose(1, 2).contiguous()
         return x.type(out_dtype)
 
     # sage attention with fixed length seems to cause NaN in I2V inference.

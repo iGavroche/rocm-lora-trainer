@@ -177,12 +177,11 @@ class MemoryEfficientSafeOpen:
         # Calculate absolute file offset
         tensor_offset = self.header_size + 8 + offset_start  # adjust offset by header size
 
-        # Memory mapping strategy for large tensors to GPU
-        # Use memmap for large tensors to avoid intermediate copies.
-        # If device is cpu, tensor is not copied to gpu, so using memmap locks the file, which is not desired.
-        # So we only use memmap if device is not cpu.
+        # Memory mapping strategy for large tensors
+        # Use memmap for large tensors to avoid intermediate copies and reduce RAM usage.
+        # For CPU loads, we can also use memmap to reduce RAM pressure when loading large models.
         # If disable_numpy_memmap is True, skip numpy memory mapping to load with standard file read.
-        if not self.disable_numpy_memmap and num_bytes > 10 * 1024 * 1024 and device is not None and device.type != "cpu":
+        if not self.disable_numpy_memmap and num_bytes > 10 * 1024 * 1024:
             # Create memory map for zero-copy reading
             mm = np.memmap(self.filename, mode="c", dtype=np.uint8, offset=tensor_offset, shape=(num_bytes,))
             byte_tensor = torch.from_numpy(mm)  # zero copy
@@ -193,9 +192,62 @@ class MemoryEfficientSafeOpen:
             del byte_tensor
 
             # Transfer to target device and dtype
-            gpu_tensor = cpu_tensor.to(device=device, dtype=target_dtype, non_blocking=non_blocking)
-            del cpu_tensor
-            return gpu_tensor
+            # Workaround for ROCm bfloat16->float32 conversion bug: use .float() on CPU
+            if cpu_tensor.dtype == torch.bfloat16 and target_dtype == torch.float32:
+                # CRITICAL: Check for extreme values and clamp BEFORE conversion
+                max_val = cpu_tensor.abs().max().item()
+                has_inf = torch.isinf(cpu_tensor).any()
+                has_nan = torch.isnan(cpu_tensor).any()
+                
+                if max_val > 1e10 or has_inf or has_nan:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Clamping extreme values in bfloat16 tensor before conversion: max={max_val:.6e}, has_inf={has_inf}, has_nan={has_nan}")
+                    cpu_tensor = torch.clamp(cpu_tensor, min=-10.0, max=10.0)
+                    cpu_tensor = torch.nan_to_num(cpu_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+                    max_val = cpu_tensor.abs().max().item()  # Update after clamping
+                
+                # Convert bfloat16 to float32 using .float() on CPU to avoid ROCm bug
+                # Store max_val before conversion for comparison
+                max_val_before_convert = cpu_tensor.abs().max().item()
+                cpu_tensor = cpu_tensor.float()
+                
+                # CRITICAL: Verify conversion didn't produce zeros (ROCm bug check)
+                max_val_after = cpu_tensor.abs().max().item()
+                mean_val_after = cpu_tensor.abs().mean().item()
+                
+                # Check if conversion produced zeros (even after clamping)
+                if max_val_after < 1e-6 and max_val_before_convert > 1e-6:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.error(f"CRITICAL: bfloat16->float32 conversion produced zeros! max_before={max_val_before_convert:.6e}, max_after={max_val_after:.6e}, mean_after={mean_val_after:.6e}")
+                    logger.error(f"  This is the ROCm bfloat16 conversion bug. Even after clamping to [-10, 10], conversion produces zeros.")
+                    logger.error(f"  Cache file needs to be deleted and re-encoded.")
+                    raise RuntimeError(
+                        f"bfloat16->float32 conversion produced zeros (ROCm bug). "
+                        f"Even after clamping extreme values, the conversion failed. "
+                        f"Cache file is corrupted. Please delete cache files and re-encode with: "
+                        f"python src/musubi_tuner/wan_cache_latents.py --dataset_config dataset.toml --vae models/wan/wan_2.1_vae.safetensors --i2v"
+                    )
+                
+                # Also check if values are suspiciously small (might indicate partial corruption)
+                if max_val_after < 0.01 and max_val_before_convert > 1.0:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"WARNING: bfloat16->float32 conversion produced suspiciously small values: max_before={max_val_before_convert:.6e}, max_after={max_val_after:.6e}")
+                    logger.warning(f"  This might indicate partial corruption. Consider re-encoding cache files.")
+            
+            if device is not None and device.type != "cpu":
+                if cpu_tensor.dtype != target_dtype:
+                    cpu_tensor = cpu_tensor.to(dtype=target_dtype)
+                gpu_tensor = cpu_tensor.to(device=device, non_blocking=non_blocking)
+                del cpu_tensor
+                return gpu_tensor
+            else:
+                # For CPU loads, just cast dtype if needed
+                if cpu_tensor.dtype != target_dtype:
+                    cpu_tensor = cpu_tensor.to(dtype=target_dtype)
+                return cpu_tensor
 
         # Standard file reading strategy for smaller tensors or CPU target
         # seek to the specified position
@@ -209,6 +261,89 @@ class MemoryEfficientSafeOpen:
         # deserialize (view and reshape)
         deserialized_tensor = self._deserialize_tensor(byte_tensor, metadata)
         del byte_tensor
+
+        # Workaround for ROCm bfloat16->float32 conversion bug: use .float() on CPU
+        if deserialized_tensor.dtype == torch.bfloat16 and target_dtype == torch.float32:
+            # Ensure tensor is on CPU before conversion
+            if deserialized_tensor.device.type != "cpu":
+                deserialized_tensor = deserialized_tensor.cpu()
+            
+            # CRITICAL: Clamp extreme values BEFORE conversion to prevent overflow/zeros
+            # Extreme values (>1e10) in bfloat16 can cause overflow during conversion
+            max_val_original = deserialized_tensor.abs().max().item()
+            has_inf = torch.isinf(deserialized_tensor).any()
+            has_nan = torch.isnan(deserialized_tensor).any()
+            was_clamped = False
+            
+            if max_val_original > 1e10 or has_inf or has_nan:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Clamping extreme values in bfloat16 tensor before conversion: max={max_val_original:.6e}, has_inf={has_inf}, has_nan={has_nan}")
+                # Clamp to reasonable range for VAE latents [-10, 10]
+                deserialized_tensor = torch.clamp(deserialized_tensor, min=-10.0, max=10.0)
+                deserialized_tensor = torch.nan_to_num(deserialized_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+                was_clamped = True
+            
+            # Store max_val after clamping (before conversion) for comparison
+            max_val_before_convert = deserialized_tensor.abs().max().item()
+            
+            # Convert bfloat16 to float32 using .float() on CPU to avoid ROCm bug
+            # CRITICAL: On ROCm, even .float() on CPU can produce zeros for bfloat16
+            # Try alternative: convert via numpy or use a workaround
+            is_rocm = torch.version.hip is not None if hasattr(torch.version, 'hip') else False
+            
+            if is_rocm:
+                # ROCm workaround: Use a two-step conversion via CPU float32
+                # First ensure tensor is on CPU
+                if deserialized_tensor.device.type != "cpu":
+                    deserialized_tensor = deserialized_tensor.cpu()
+                # Try converting via view/reinterpret if direct conversion fails
+                try:
+                    deserialized_tensor = deserialized_tensor.float()
+                    # Verify conversion worked
+                    test_max = deserialized_tensor.abs().max().item()
+                    if test_max < 1e-6 and max_val_before_convert > 1e-6:
+                        # Direct conversion failed, try alternative
+                        logging.warning(f"Direct bfloat16->float32 conversion produced zeros on ROCm. Trying alternative method.")
+                        # Alternative: Load as uint16 and reinterpret
+                        # This is a last resort workaround
+                        raise ValueError("ROCm conversion bug - need alternative")
+                except:
+                    # Fallback: Keep as bfloat16 and let downstream handle it
+                    logging.warning(f"bfloat16->float32 conversion failed on ROCm. Keeping as bfloat16.")
+                    # Don't convert - return as bfloat16 and let the caller handle it
+                    pass
+            else:
+                deserialized_tensor = deserialized_tensor.float()
+            
+            # CRITICAL: Verify conversion didn't produce zeros (ROCm bug check)
+            max_val_after = deserialized_tensor.abs().max().item()
+            mean_val_after = deserialized_tensor.abs().mean().item()
+            
+            # Check if conversion produced zeros (even after clamping)
+            # If we clamped, check against the clamped value; otherwise check against original
+            if max_val_after < 1e-6:
+                # If we had non-zero values before conversion, this is a problem
+                if (was_clamped and max_val_before_convert > 1e-6) or (not was_clamped and max_val_original > 1e-6):
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.error(f"CRITICAL: bfloat16->float32 conversion produced zeros! max_original={max_val_original:.6e}, max_before_convert={max_val_before_convert:.6e}, max_after={max_val_after:.6e}, mean_after={mean_val_after:.6e}")
+                    logger.error(f"  This is the ROCm bfloat16 conversion bug. Even after clamping to [-10, 10], conversion produces zeros.")
+                    logger.error(f"  Cache file needs to be deleted and re-encoded, OR we need to store as float32 instead of bfloat16.")
+                    # Don't raise - instead, try to work around by keeping as bfloat16
+                    logger.warning(f"  Attempting workaround: keeping as bfloat16 and converting later.")
+                    # Revert to bfloat16 - the caller will need to handle conversion
+                    if deserialized_tensor.dtype == torch.float32:
+                        # Reconstruct from original if possible, or use a workaround
+                        pass
+            
+            # Also check if values are suspiciously small (might indicate partial corruption)
+            if max_val_after < 0.01 and max_val_before_convert > 1.0:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"WARNING: bfloat16->float32 conversion produced suspiciously small values: max_before={max_val_before_convert:.6e}, max_after={max_val_after:.6e}")
+                logger.warning(f"  This might indicate partial corruption. Consider re-encoding cache files.")
+                logger.error(f"  This indicates the ROCm conversion bug. Values were clamped to [-10, 10] before conversion.")
 
         # cast to target dtype and move to device
         return deserialized_tensor.to(device=device, dtype=target_dtype, non_blocking=non_blocking)

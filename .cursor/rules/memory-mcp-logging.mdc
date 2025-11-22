@@ -1,0 +1,27 @@
+---
+description: Memory MCP logging requirements for tracking failures and successes
+alwaysApply: true
+---
+
+# Memory MCP Logging
+
+**MANDATORY: Log all failures and successes to Memory MCP**
+
+## Log Failures
+
+When something doesn't work, log to memory MCP:
+- What was attempted
+- Why it failed
+- What the error was
+- What was tested
+
+## Log Successes
+
+When something works, log to memory MCP:
+- What worked
+- Under what conditions
+- What tests verified it
+
+## Before Implementing
+
+Check memory MCP for previous attempts and results to avoid repeating failed approaches.

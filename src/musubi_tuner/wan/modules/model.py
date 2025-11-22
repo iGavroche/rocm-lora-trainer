@@ -1069,8 +1069,30 @@ def load_wan_model(
     info = model.load_state_dict(sd, strict=True, assign=True)
     if dit_weight_dtype is not None:
         # cast model weights to the specified dtype. This makes sure that the model is in the correct dtype
-        logger.info(f"Casting model weights to {dit_weight_dtype}")
-        model = model.to(dit_weight_dtype)
+        current_device = next(model.parameters()).device
+        current_dtype = next(model.parameters()).dtype
+        
+        # Only convert if dtype actually needs to change
+        if current_dtype != dit_weight_dtype:
+            # For float8 conversion, move to CPU first to save GPU memory during conversion
+            # For other dtypes (float16/bf16), conversion is lightweight and can be done in place
+            if dit_weight_dtype == torch.float8_e4m3fn and current_device.type != "cpu":
+                logger.info(f"Moving model to CPU for float8 dtype conversion to save GPU memory")
+                model = model.to("cpu")
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
+            logger.info(f"Casting model weights from {current_dtype} to {dit_weight_dtype}")
+            model = model.to(dit_weight_dtype)
+            
+            # Move back to target device if we moved to CPU and target is not CPU
+            if dit_weight_dtype == torch.float8_e4m3fn and loading_device.type != "cpu" and current_device.type != "cpu":
+                logger.info(f"Moving model back to {loading_device}")
+                model = model.to(loading_device)
+        else:
+            # Dtype already matches, just ensure device is correct
+            if current_device != loading_device:
+                logger.info(f"Model dtype already correct ({current_dtype}), moving to {loading_device}")
+                model = model.to(loading_device)
     logger.info(f"Loaded DiT model from {dit_path}, info={info}")
 
     return model

@@ -1,0 +1,40 @@
+---
+description: Testing requirements and best practices for musubi-tuner
+alwaysApply: true
+---
+
+# Testing Requirements
+
+**CRITICAL: Always write and run end-to-end tests before claiming something "should work".**
+
+## Never Say "Should Work" Without Testing
+
+If you implement a fix, you MUST:
+- Write a test that reproduces the issue
+- Write a test that verifies the fix works
+- Run the test and confirm it passes
+- Test with real data/files when possible
+- Show actual test output, not just "tests pass"
+
+## End-to-End Testing is Mandatory
+
+For any fix that affects the training pipeline:
+- Test the complete flow: cache file → dataset loader → training operations
+- Use real cache files if available
+- Verify values are non-zero at each step
+- Test with actual DataLoader worker simulation
+
+## Test Before Claiming Success
+
+Before saying a fix is complete:
+- Run the actual training command or a simulation
+- Verify the fix works in the real environment
+- Check for edge cases (Inf, NaN, extreme values)
+
+## Analytical Testing
+
+When you think something "should" work:
+- Write a test instead of assuming
+- Run the test and see if it actually works
+- If it fails, analyze why and fix it
+- If it passes, verify it works in the real training context

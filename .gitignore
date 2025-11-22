@@ -13,3 +13,10 @@ GEMINI.md
 AGENTS.md
 .vscode/settings.json
 .mcp.json
+*.safetensors
+src/logs/
+src/wandb/
+src/datasets/
+src/models/
+src/results/
+myface/

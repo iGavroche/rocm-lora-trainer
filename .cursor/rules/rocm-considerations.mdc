@@ -1,0 +1,37 @@
+---
+description: ROCm/AMD GPU specific considerations and workarounds
+globs:
+  - "**/*rocm*"
+  - "**/*ROCm*"
+  - "**/hv_train_network.py"
+  - "**/wan_cache_latents.py"
+alwaysApply: false
+---
+
+# ROCm/AMD GPU Considerations
+
+## Dtype Conversions
+- Always test dtype conversions on CPU first
+- Use `.float()` instead of `.to(torch.float32)` for bfloat16→float32 on ROCm
+- Clamp extreme values (>1e10) as they may indicate corruption
+- Test with actual cache files, not just synthetic data
+
+## Known Issues
+- bfloat16 conversion can produce zeros on ROCm - use float32 for critical operations
+- `expandable_segments` not supported on ROCm (PyTorch shows warning)
+- Windows + ROCm requires `num_workers=0` for DataLoader
+- Windows + ROCm requires `HIP_DISABLE_IPC=1` environment variable
+- Strix Halo (gfx1151) requires `HSA_OVERRIDE_GFX_VERSION=11.5.1`
+
+## What Works
+- `HIP_DISABLE_IPC=1` - required for Windows + ROCm multiprocessing
+- `HSA_OVERRIDE_GFX_VERSION=11.5.1` - required for Strix Halo
+- `num_workers=0` - required for Windows + ROCm DataLoader
+- Contiguous tensors (`.contiguous()`) - standard PyTorch best practice
+- Pinned memory (`.pin_memory()`) - standard PyTorch best practice
+
+## What Doesn't Work
+- Accelerate `device_placement` parameter - does not prevent tensor corruption
+- Direct GPU loading from cache - still produces zeros
+- Multiple transfer method fallbacks - all fail in training context
+- Accelerate DataLoader wrapper - causes tensor corruption

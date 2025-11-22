@@ -1,0 +1,32 @@
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 0: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 1: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 1: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 2: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 2: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 0: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 1: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 1: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 2: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 2: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 0: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 1: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 1: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 2: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 2: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 0: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cpu, max=2.049449e+00
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 0: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 1: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 1: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 2: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 2: latents shape=torch.Size([1, 16, 1, 64, 64]), dtype=torch.float32, device=cuda:0, max=0.000000e+00
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']
+Step 0: Batch keys: ['latents', 'latents_image', 't5', 'timesteps']

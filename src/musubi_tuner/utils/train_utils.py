@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import os
 import shutil
 from typing import Callable
@@ -63,20 +64,39 @@ class LossRecorder:
     def __init__(self):
         self.loss_list: list[float] = []
         self.loss_total: float = 0.0
+        self.valid_count: int = 0  # Count of non-NaN losses
 
     def add(self, *, epoch: int, step: int, loss: float) -> None:
-        if epoch == 0:
-            self.loss_list.append(loss)
+        # Skip NaN and Inf values to prevent corrupting the average
+        if not (math.isnan(loss) or math.isinf(loss)):
+            if epoch == 0:
+                self.loss_list.append(loss)
+                self.valid_count += 1
+            else:
+                while len(self.loss_list) <= step:
+                    self.loss_list.append(0.0)
+                old_loss = self.loss_list[step]
+                if not (math.isnan(old_loss) or math.isinf(old_loss)):
+                    self.loss_total -= old_loss
+                    self.valid_count -= 1
+                self.loss_list[step] = loss
+                self.valid_count += 1
+            self.loss_total += loss
         else:
-            while len(self.loss_list) <= step:
-                self.loss_list.append(0.0)
-            self.loss_total -= self.loss_list[step]
-            self.loss_list[step] = loss
-        self.loss_total += loss
+            # Still add to list to maintain step alignment, but don't count in total
+            if epoch == 0:
+                self.loss_list.append(loss)
+            else:
+                while len(self.loss_list) <= step:
+                    self.loss_list.append(0.0)
+                self.loss_list[step] = loss
 
     @property
     def moving_average(self) -> float:
-        return self.loss_total / len(self.loss_list)
+        if self.valid_count == 0:
+            # If no valid losses, return nan (will display as 'nan' in progress bar)
+            return float('nan')
+        return self.loss_total / self.valid_count
 
 
 def get_epoch_ckpt_name(model_name, epoch_no: int):

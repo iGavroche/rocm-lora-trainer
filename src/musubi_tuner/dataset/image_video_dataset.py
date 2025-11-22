@@ -216,13 +216,65 @@ def save_latent_cache_wan(
 
     _, F, H, W = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
-    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu()}
+    
+    # CRITICAL: Always clamp to reasonable range [-10, 10] before saving
+    # VAE latents should never exceed this range. Convert to float32 first for accurate clamping
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    original_dtype = latent.dtype
+    # CRITICAL: Move to CPU first to avoid ROCm conversion issues
+    latent_cpu = latent.detach().cpu()
+    latent_f32 = latent_cpu.float() if latent_cpu.dtype != torch.float32 else latent_cpu
+    
+    # CRITICAL: Always clamp unconditionally - extreme values indicate corruption
+    # Don't check threshold first, just clamp to be safe
+    max_val = latent_f32.abs().max().item()
+    if max_val > 10.0 or torch.isinf(latent_f32).any() or torch.isnan(latent_f32).any():
+        logger.warning(f"Clamping extreme values in latent before saving: max={max_val:.6e}")
+    # Always clamp to [-10, 10] regardless of current values to ensure safety
+    latent_f32 = torch.clamp(latent_f32, min=-10.0, max=10.0)
+    latent_f32 = torch.nan_to_num(latent_f32, nan=0.0, posinf=10.0, neginf=-10.0)
+    # Verify clamping worked
+    max_val_after = latent_f32.abs().max().item()
+    if max_val_after > 10.0:
+        logger.error(f"CRITICAL: Clamping failed! max_val_after={max_val_after:.6e}")
+        raise RuntimeError(f"Clamping failed: max_val={max_val:.6e}, max_val_after={max_val_after:.6e}")
+    
+    # CRITICAL: ROCm bfloat16 conversion bug - even converting clamped values produces zeros
+    # Solution: Always store as float32 to avoid the conversion bug entirely
+    # This prevents zeros when loading bfloat16 tensors on ROCm
+    latent_cpu = latent_f32.detach().cpu()
+    # Always store as float32 regardless of original dtype to avoid ROCm corruption
+    dtype_str = "float32"
+    if original_dtype == torch.bfloat16:
+        logger.info(f"Storing bfloat16 latents as float32 to avoid ROCm conversion bug")
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent_cpu}
 
     if clip_embed is not None:
         sd[f"clip_{dtype_str}"] = clip_embed.detach().cpu()
 
     if image_latent is not None:
-        sd[f"latents_image_{F}x{H}x{W}_{dtype_str}"] = image_latent.detach().cpu()
+        # CRITICAL: Always clamp to reasonable range [-10, 10] before saving
+        # Convert to float32 first for accurate clamping, then clamp unconditionally
+        original_dtype_img = image_latent.dtype
+        # Move to CPU first to avoid ROCm conversion issues
+        image_latent_cpu = image_latent.detach().cpu()
+        image_latent_f32 = image_latent_cpu.float()
+        
+        # Always clamp unconditionally - don't check threshold since bfloat16 can't represent it accurately
+        max_val_img = image_latent_f32.abs().max().item()
+        if max_val_img > 10.0 or torch.isinf(image_latent_f32).any() or torch.isnan(image_latent_f32).any():
+            logger.warning(f"Clamping extreme values in image_latent before saving: max={max_val_img:.6e}")
+        image_latent_f32 = torch.clamp(image_latent_f32, min=-10.0, max=10.0)
+        image_latent_f32 = torch.nan_to_num(image_latent_f32, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        # CRITICAL: ROCm bfloat16 conversion bug - even converting clamped values produces extreme values
+        # Solution: Always store as float32 to avoid the conversion bug entirely
+        # Store as float32 regardless of original dtype to avoid ROCm corruption
+        dtype_str_img = "float32"
+        logger.info(f"Storing image_latents as float32 to avoid ROCm bfloat16 conversion bug (original dtype was {original_dtype_img})")
+        sd[f"latents_image_{F}x{H}x{W}_{dtype_str_img}"] = image_latent_f32
 
     if control_latent is not None:
         sd[f"latents_control_{F}x{H}x{W}_{dtype_str}"] = control_latent.detach().cpu()
@@ -748,9 +800,85 @@ class BucketBatchManager:
         batch_tensor_data = {}
         varlen_keys = set()
         for item_info in bucket[start:end]:
-            sd_latent = load_file(item_info.latent_cache_path)
-            sd_te = load_file(item_info.text_encoder_output_cache_path)
+            # Use memory-efficient loader to avoid ROCm bfloat16 conversion bug
+            # Load directly as float32 to bypass the bug
+            from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+            
+            # ROCm WORKAROUND: Always load to CPU first, then verify values are non-zero
+            # Loading directly to GPU via get_tensor also corrupts tensors on ROCm (they become zeros)
+            # We must load to CPU, verify, then handle GPU transfer separately in training loop
+            sd_latent = {}
+            with MemoryEfficientSafeOpen(item_info.latent_cache_path, disable_numpy_memmap=False) as f:
+                cache_keys = list(f.keys())
+                # Write to file to debug worker processes
+                try:
+                    with open("debug_cache_load.txt", "a") as debug_file:
+                        debug_file.write(f"Loading cache: {item_info.latent_cache_path}, keys: {cache_keys}\n")
+                except:
+                    pass
+                logger.debug(f"Loading cache file: {item_info.latent_cache_path}, keys: {cache_keys}")
+                
+                for key in cache_keys:
+                    # CRITICAL: Always load to CPU first - loading directly to GPU corrupts tensors on ROCm
+                    # Load as float32 to avoid ROCm bfloat16->float32 conversion bug
+                    # The get_tensor method now clamps extreme values BEFORE conversion
+                    tensor = f.get_tensor(key, device=torch.device("cpu"), dtype=torch.float32)
+                    
+                    # DEBUG: Log what we loaded (only for first few items to avoid spam)
+                    max_val_loaded = tensor.abs().max().item()
+                    mean_val_loaded = tensor.abs().mean().item()
+                    
+                    # Write to file for debugging
+                    try:
+                        with open("debug_cache_load.txt", "a") as debug_file:
+                            debug_file.write(f"  Loaded '{key}': shape={tensor.shape}, dtype={tensor.dtype}, max={max_val_loaded:.6e}, mean={mean_val_loaded:.6e}\n")
+                    except:
+                        pass
+                    
+                    # CRITICAL: If tensor is all zeros after loading from cache, the cache file is corrupted
+                    # This means the cache was saved with zeros (VAE encoding failed or cache save bug)
+                    if max_val_loaded < 1e-6:
+                        error_msg = f"Cache file corrupted: {item_info.latent_cache_path} - tensor '{key}' is all zeros. Delete this file and re-encode."
+                        logger.error(f"CRITICAL: {error_msg}")
+                        logger.error(f"  This means the cache file was saved with zeros (VAE encoding failed or cache save bug).")
+                        logger.error(f"  ACTION REQUIRED: Delete this cache file and re-encode: {item_info.latent_cache_path}")
+                        # Raise immediately to stop training with corrupted data
+                        raise RuntimeError(error_msg)
+                    
+                    logger.debug(f"Loaded tensor '{key}' to CPU: shape={tensor.shape}, dtype={tensor.dtype}, max={max_val_loaded:.6e}, mean={mean_val_loaded:.6e}")
+                    
+                    # Clamp Inf/NaN values (extreme values should already be clamped in get_tensor)
+                    # VAE latents should be in reasonable range [-10, 10], values outside this are corrupted
+                    if torch.isinf(tensor).any() or torch.isnan(tensor).any():
+                        tensor = torch.clamp(tensor, min=-10.0, max=10.0)
+                        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+                    
+                    # Double-check for extreme values (shouldn't happen if clamping in get_tensor worked)
+                    max_val = tensor.abs().max().item()
+                    if max_val > 1e10:
+                        logger.warning(f"WARNING: Tensor '{key}' has extreme values ({max_val:.6e}) after loading. Clamping to [-10, 10].")
+                        tensor = torch.clamp(tensor, min=-10.0, max=10.0)
+                    
+                    # Store on CPU - we'll move to GPU in training loop (if that works)
+                    sd_latent[key] = tensor
+            
+            sd_te = {}
+            with MemoryEfficientSafeOpen(item_info.text_encoder_output_cache_path, disable_numpy_memmap=False) as f:
+                for key in f.keys():
+                    # Load as float32 directly to avoid ROCm bfloat16->float32 conversion bug
+                    tensor = f.get_tensor(key, device=torch.device("cpu"), dtype=torch.float32)
+                    sd_te[key] = tensor
+            
             sd = {**sd_latent, **sd_te}
+            
+            # DEBUG: Log what keys we have before mapping
+            try:
+                with open("debug_cache_load.txt", "a") as debug_file:
+                    debug_file.write(f"  sd_latent keys: {list(sd_latent.keys())}\n")
+                    debug_file.write(f"  sd_te keys: {list(sd_te.keys())}\n")
+                    debug_file.write(f"  sd keys (before mapping): {list(sd.keys())}\n")
+            except:
+                pass
 
             # TODO refactor this
             for key in sd.keys():
@@ -763,12 +891,39 @@ class BucketBatchManager:
                 if content_key.endswith("_mask"):
                     pass
                 else:
+                    # Remove dtype suffix (e.g., "_float32", "_bfloat16")
+                    original_key = content_key
                     content_key = content_key.rsplit("_", 1)[0]  # remove dtype
+                    
+                    # Handle latents keys - convert "latents_1x64x64" -> "latents"
                     if content_key.startswith("latents_"):
-                        content_key = content_key.rsplit("_", 1)[0]  # remove FxHxW
+                        if content_key.startswith("latents_image_"):
+                            # "latents_image_1x64x64" -> "latents_image"
+                            content_key = content_key.rsplit("_", 1)[0]  # remove FxHxW
+                        elif content_key.startswith("latents_control_"):
+                            # "latents_control_1x64x64" -> "latents_control"
+                            content_key = content_key.rsplit("_", 1)[0]  # remove FxHxW
+                        else:
+                            # For "latents_1x64x64", convert to just "latents"
+                            # This is the main video latents key that training expects
+                            # Pattern: "latents_" followed by numbers and 'x' (e.g., "1x64x64")
+                            parts = content_key.split("_", 1)  # Split into ["latents", "1x64x64"]
+                            if len(parts) == 2 and parts[0] == "latents" and "x" in parts[1]:
+                                # This matches "latents_1x64x64" pattern, convert to "latents"
+                                content_key = "latents"
 
                 if content_key not in batch_tensor_data:
                     batch_tensor_data[content_key] = []
+                
+                # DEBUG: Log key mapping for latents
+                if "latent" in content_key.lower():
+                    try:
+                        with open("debug_cache_load.txt", "a") as debug_file:
+                            tensor_val = sd[key].abs().max().item()
+                            debug_file.write(f"  Mapping: '{key}' -> '{content_key}', tensor max={tensor_val:.6e}\n")
+                    except:
+                        pass
+                
                 batch_tensor_data[content_key].append(sd[key])
 
                 if is_varlen_key:
@@ -776,7 +931,44 @@ class BucketBatchManager:
 
         for key in batch_tensor_data.keys():
             if key not in varlen_keys:
-                batch_tensor_data[key] = torch.stack(batch_tensor_data[key])
+                # DEBUG: Check values before stacking
+                if key == "latents" and len(batch_tensor_data[key]) > 0:
+                    # Check first tensor before stacking
+                    first_tensor = batch_tensor_data[key][0]
+                    max_val_before = first_tensor.abs().max().item()
+                    # Use print to ensure it shows up
+                    print(f"[DATASET DEBUG] Before stacking '{key}': first tensor max={max_val_before:.6e}, shape={first_tensor.shape}, dtype={first_tensor.dtype}, device={first_tensor.device}")
+                    logger.info(f"Before stacking '{key}': first tensor max={max_val_before:.6e}, shape={first_tensor.shape}, dtype={first_tensor.dtype}, device={first_tensor.device}")
+                    if max_val_before < 1e-6:
+                        print(f"[DATASET ERROR] CRITICAL: First tensor in '{key}' list is all zeros before stacking!")
+                        logger.error(f"CRITICAL: First tensor in '{key}' list is all zeros before stacking!")
+                
+                # CRITICAL: Stack and ensure contiguous for ROCm compatibility
+                # torch.stack() may create non-contiguous tensors which cause zeros on ROCm
+                stacked = torch.stack(batch_tensor_data[key])
+                # Ensure contiguous memory layout (ROCm requirement)
+                batch_tensor_data[key] = stacked.contiguous()
+                
+                # DEBUG: Log latents key to verify it's correct
+                if key == "latents":
+                    latents_tensor = batch_tensor_data[key]
+                    max_val = latents_tensor.abs().max().item()
+                    mean_val = latents_tensor.abs().mean().item()
+                    is_contig = latents_tensor.is_contiguous()
+                    # Use print to ensure it shows up
+                    print(f"[DATASET DEBUG] After stacking '{key}': max={max_val:.6e}, mean={mean_val:.6e}, shape={latents_tensor.shape}, dtype={latents_tensor.dtype}, device={latents_tensor.device}, contiguous={is_contig}")
+                    if max_val < 1e-6:
+                        print(f"[DATASET ERROR] CRITICAL: Batch latents key '{key}' contains all zeros after stacking!")
+                        print(f"[DATASET ERROR]   Available keys in batch: {list(batch_tensor_data.keys())}")
+                        logger.error(f"CRITICAL: Batch latents key '{key}' contains all zeros after stacking! shape={latents_tensor.shape}, dtype={latents_tensor.dtype}, device={latents_tensor.device}")
+                        logger.error(f"  This means either: 1) key mapping failed, 2) cache is corrupted, or 3) tensors became zeros during stacking")
+                        # Log all keys to help debug
+                        logger.error(f"  Available keys in batch: {list(batch_tensor_data.keys())}")
+                        # Check if it's a ROCm issue with stacking
+                        if latents_tensor.device.type == "cuda":
+                            logger.error(f"  CRITICAL: Tensor is on CUDA/ROCm - this might be a ROCm bug where stacking zeros tensors on GPU")
+                    else:
+                        logger.info(f"Batch latents key '{key}' loaded successfully: shape={latents_tensor.shape}, dtype={latents_tensor.dtype}, device={latents_tensor.device}, max={max_val:.6e}, mean={mean_val:.6e}")
 
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps

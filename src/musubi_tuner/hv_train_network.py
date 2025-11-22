@@ -47,11 +47,37 @@ from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO,
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid, resize_image_to_bucket, encode_to_latents
 
 import logging
+import os
 
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+
+# Enable verbose logging based on environment variables
+log_level = os.environ.get("MUSUBI_LOG_LEVEL", "INFO").upper()
+if log_level == "DEBUG":
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+else:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Enable PyTorch verbose logging if requested
+if os.environ.get("PYTORCH_VERBOSE", "0") == "1":
+    import torch._dynamo
+    torch._dynamo.config.verbose = True
+    torch._dynamo.config.log_level = logging.DEBUG
+    
+    # Enable autograd anomaly detection
+    torch.autograd.set_detect_anomaly(True)
+    logger.info("PyTorch verbose logging and anomaly detection enabled")
+
+# Log ROCm/HIP environment variables for debugging
+if torch.cuda.is_available() and hasattr(torch.version, 'hip') and torch.version.hip:
+    logger.info("ROCm environment variables:")
+    rocm_vars = ["HIP_LAUNCH_BLOCKING", "AMD_LOG_LEVEL", "HIP_VISIBLE_DEVICES", 
+                 "ROCM_DEBUG", "HIP_PROFILE", "HIP_DISABLE_IPC", "HSA_OVERRIDE_GFX_VERSION"]
+    for var in rocm_vars:
+        value = os.environ.get(var, "not set")
+        logger.info(f"  {var}={value}")
 
 
 SS_METADATA_KEY_BASE_MODEL_VERSION = "ss_base_model_version"
@@ -323,14 +349,17 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
     schedule_timesteps = noise_scheduler.timesteps.to(device)
     timesteps = timesteps.to(device)
 
-    # if sum([(schedule_timesteps == t) for t in timesteps]) < len(timesteps):
-    if any([(schedule_timesteps == t).sum() == 0 for t in timesteps]):
-        # raise ValueError("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
-        # round to nearest timestep
-        logger.warning("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
-        step_indices = [torch.argmin(torch.abs(schedule_timesteps - t)).item() for t in timesteps]
-    else:
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+    # Check each timestep individually and use rounding if not found
+    step_indices = []
+    for t in timesteps:
+        matches = (schedule_timesteps == t).nonzero()
+        if matches.numel() > 0:
+            step_indices.append(matches.item())
+        else:
+            # Round to nearest timestep if not found
+            nearest_idx = torch.argmin(torch.abs(schedule_timesteps - t)).item()
+            step_indices.append(nearest_idx)
+            logger.debug(f"Timestep {t.item()} not in schedule, using nearest: {schedule_timesteps[nearest_idx].item()}")
 
     sigma = sigmas[step_indices].flatten()
     while len(sigma.shape) < n_dim:
@@ -1655,6 +1684,10 @@ class NetworkTrainer:
                 " / モデル読み込み時のnumpyメモリマッピングを無効にします（Wan、FramePack、Qwen-Imageでのみ有効）。これによりメモリ使用量が増える可能性がありますが、場合によっては読み込みが高速化されることがあります"
             )
 
+        # Set default output_dir if not specified (needed for epoch saves)
+        if args.output_dir is None:
+            args.output_dir = "."
+
         # check model specific arguments
         self.handle_model_specific_args(args)
 
@@ -1851,13 +1884,28 @@ class NetworkTrainer:
         # num workers for data loader: if 0, persistent_workers is not available
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
 
+        # persistent_workers requires num_workers > 0
+        # On Windows with ROCm, num_workers=0 avoids multiprocessing issues that cause tensor zeroing
+        use_persistent_workers = args.persistent_data_loader_workers and n_workers > 0
+
+        # ROCm WORKAROUND: Always disable pin_memory when using direct GPU loading
+        # pin_memory only works for CPU tensors, but we're loading directly to GPU to bypass CPU->GPU transfer
+        # We'll set MUSUBI_TRAIN_DEVICE after DataLoader creation, so we always disable pin_memory for ROCm
+        # This prevents the "cannot pin 'torch.cuda.FloatTensor'" error
+        use_pin_memory = False  # Always disabled for ROCm direct GPU loading
+        if os.environ.get("HIP_DISABLE_IPC") == "1":
+            logger.info("ROCm detected: Disabling pin_memory (tensors loaded directly to GPU, pin_memory only works for CPU tensors)")
+        else:
+            logger.info("Disabling pin_memory (direct GPU loading enabled)")
+        
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,
             shuffle=True,
             collate_fn=collator,
             num_workers=n_workers,
-            persistent_workers=args.persistent_data_loader_workers,
+            persistent_workers=use_persistent_workers,
+            pin_memory=use_pin_memory,
         )
 
         # calculate max_train_steps
@@ -1910,8 +1958,28 @@ class NetworkTrainer:
             transformer = self.compile_transformer(args, transformer)
             transformer.__dict__["_orig_mod"] = transformer  # for annoying accelerator checks
 
-        network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
+        # ROCm WORKAROUND: Don't prepare DataLoader with Accelerate
+        # Accelerate's DataLoader wrapper corrupts tensors on ROCm (they become zeros)
+        # Use raw PyTorch DataLoader instead and handle device placement manually
+        # This bypasses Accelerate's potentially buggy DataLoader code
+        # 
+        # Research findings: Accelerate's DataLoader wrapper is incompatible with ROCm on Windows.
+        # Even with device_placement=False, Accelerate may corrupt tensors before we can move them.
+        # By not preparing the DataLoader, we use raw PyTorch DataLoader which should work correctly.
+        # See docs/ROCM_TENSOR_CORRUPTION_RESEARCH.md for details.
+        network, optimizer, lr_scheduler = accelerator.prepare(
+            network, optimizer, lr_scheduler
+        )
+        # DO NOT prepare train_dataloader - use it directly from PyTorch
+        # This avoids Accelerate's DataLoader wrapper which corrupts tensors on ROCm
+        # We'll handle device placement manually in the training loop
         training_model = network
+        
+        # ROCm WORKAROUND: Do NOT set MUSUBI_TRAIN_DEVICE - loading directly to GPU corrupts tensors
+        # Cache files are valid (verified), but loading directly to GPU via get_tensor(device=cuda) 
+        # uses .to(device) which corrupts tensors on ROCm. We must load to CPU first.
+        # The dataset will load to CPU, then we'll try to move to GPU in the training loop.
+        logger.info(f"Loading cache files to CPU (GPU loading corrupts tensors on ROCm)")
 
         if args.gradient_checkpointing:
             transformer.train()
@@ -2163,28 +2231,505 @@ class NetworkTrainer:
             for step, batch in enumerate(train_dataloader):
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
-                latents = batch["latents"]
+                # DEBUG: Check batch keys and latents before accessing
+                if step < 3:
+                    # Write to file to ensure we see it even from workers
+                    with open("debug_batch.txt", "a") as f:
+                        f.write(f"Step {step}: Batch keys: {list(batch.keys())}\n")
+                    logger.info(f"DEBUG Step {step}: Batch keys: {list(batch.keys())}")
+                    if "latents" not in batch:
+                        with open("debug_batch.txt", "a") as f:
+                            f.write(f"Step {step}: ERROR - 'latents' key not found! Available keys: {list(batch.keys())}\n")
+                        logger.error(f"CRITICAL Step {step}: 'latents' key not found in batch! Available keys: {list(batch.keys())}")
+                        # Try to find any latent-like key
+                        latent_keys = [k for k in batch.keys() if "latent" in k.lower()]
+                        if latent_keys:
+                            logger.error(f"  Found potential latent keys: {latent_keys}")
+                        continue
+                
+                # ROCm WORKAROUND: Since we're not using Accelerate's DataLoader wrapper,
+                # tensors should be clean on CPU (not corrupted by Accelerate).
+                # Move them to GPU manually. If this still fails, it's a deeper ROCm issue.
+                # 
+                # Note: By bypassing Accelerate's DataLoader wrapper, we avoid the tensor
+                # corruption that was happening when Accelerate tried to handle device placement.
+                # The tensors should now be valid on CPU and move to GPU correctly.
+                
+                # Helper function to move tensor to GPU
+                # ROCm WORKAROUND: Try multiple methods including pinned memory and chunked transfer
+                def move_to_gpu(value, name=""):
+                    # Handle non-tensor values (lists, None, etc.)
+                    if not isinstance(value, torch.Tensor):
+                        return value
+                    
+                    if value.device.type == "cpu":
+                        max_val_cpu = value.abs().max().item()
+                        if max_val_cpu < 1e-6:
+                            # Already zeros, just move it
+                            return value.to(accelerator.device, non_blocking=False)
+                        
+                        # CRITICAL: Log tensor state before transfer
+                        if step < 3:
+                            with open("debug_batch.txt", "a") as f:
+                                f.write(f"Step {step}: move_to_gpu({name}) - CPU tensor state:\n")
+                                f.write(f"  shape={value.shape}, dtype={value.dtype}, is_contiguous={value.is_contiguous()}\n")
+                                f.write(f"  max={max_val_cpu:.6e}, min={value.min().item():.6e}, mean={value.mean().item():.6e}\n")
+                                if torch.cuda.is_available():
+                                    allocated_before = torch.cuda.memory_allocated(accelerator.device) / 1024**3
+                                    reserved_before = torch.cuda.memory_reserved(accelerator.device) / 1024**3
+                                    f.write(f"  GPU memory before: allocated={allocated_before:.2f} GB, reserved={reserved_before:.2f} GB\n")
+                        
+                        # CRITICAL: Make tensor contiguous and clone it first
+                        # Non-contiguous or view tensors might cause issues on ROCm
+                        if not value.is_contiguous():
+                            logger.warning(f"Step {step}: Tensor {name} is not contiguous, making it contiguous...")
+                            value = value.contiguous()
+                        
+                        # Clone to ensure we have a fresh copy (breaks any view relationships)
+                        value_clone = value.clone()
+                        max_val_clone = value_clone.abs().max().item()
+                        
+                        if max_val_clone < 1e-6:
+                            logger.error(f"Step {step}: CRITICAL - Cloned tensor is zeros! Original max={max_val_cpu:.6e}")
+                            with open("debug_batch.txt", "a") as f:
+                                f.write(f"Step {step}: CRITICAL ERROR - Tensor {name} became zeros after clone()!\n")
+                                f.write(f"  Original CPU max: {max_val_cpu:.6e}\n")
+                                f.write(f"  Cloned CPU max: {max_val_clone:.6e}\n")
+                            raise RuntimeError(f"Tensor {name} became zeros after clone() - this is a severe ROCm bug")
+                        
+                        # Method 1: Try with pinned memory (if available)
+                        try:
+                            if step < 3:
+                                logger.warning(f"Step {step}: Trying Method 1 (pinned memory) for {name}...")
+                            # Pin the CPU tensor to page-locked memory first
+                            if not value_clone.is_pinned():
+                                pinned_value = value_clone.pin_memory()
+                            else:
+                                pinned_value = value_clone
+                            
+                            tensor_gpu = pinned_value.to(accelerator.device, non_blocking=True)
+                            # Synchronize to ensure transfer is complete
+                            torch.cuda.synchronize(accelerator.device)
+                            max_val_gpu = tensor_gpu.abs().max().item()
+                            
+                            if step < 3:
+                                logger.warning(f"Step {step}: Method 1 result for {name}: CPU max={max_val_cpu:.6e}, Clone max={max_val_clone:.6e}, GPU max={max_val_gpu:.6e}")
+                            if max_val_gpu > 1e-6:
+                                if step < 3:
+                                    logger.info(f"Step {step}: Method 1 (pinned memory) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
+                                    with open("debug_batch.txt", "a") as f:
+                                        f.write(f"Step {step}: Method 1 SUCCESS for {name} - CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}\n")
+                                return tensor_gpu
+                            else:
+                                if step < 3:
+                                    logger.warning(f"Step {step}: Method 1 failed - GPU tensor is zeros")
+                                    with open("debug_batch.txt", "a") as f:
+                                        f.write(f"Step {step}: Method 1 FAILED for {name} - GPU tensor is zeros (CPU max={max_val_cpu:.6e})\n")
+                        except Exception as e:
+                            if step < 3:
+                                logger.warning(f"Step {step}: Method 1 (pinned memory) exception for {name}: {e}")
+                                with open("debug_batch.txt", "a") as f:
+                                    f.write(f"Step {step}: Method 1 EXCEPTION for {name}: {e}\n")
+                        
+                        # Method 2: Try direct .to() with non_blocking=False on cloned tensor
+                        try:
+                            if step < 3:
+                                logger.warning(f"Step {step}: Trying Method 2 (direct .to()) for {name}...")
+                            tensor_gpu = value_clone.to(accelerator.device, non_blocking=False)
+                            max_val_gpu = tensor_gpu.abs().max().item()
+                            
+                            if step < 3:
+                                logger.warning(f"Step {step}: Method 2 result for {name}: CPU max={max_val_cpu:.6e}, Clone max={max_val_clone:.6e}, GPU max={max_val_gpu:.6e}")
+                            if max_val_gpu > 1e-6:
+                                if step < 3:
+                                    logger.info(f"Step {step}: Method 2 (direct .to()) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
+                                return tensor_gpu
+                            else:
+                                if step < 3:
+                                    logger.warning(f"Step {step}: Method 2 failed - GPU tensor is zeros")
+                        except Exception as e:
+                            if step < 3:
+                                logger.warning(f"Step {step}: Method 2 (direct .to()) exception for {name}: {e}")
+                        
+                        # Method 3: Try copy_() with empty tensor
+                        try:
+                            tensor_gpu = torch.empty(value_clone.shape, dtype=value_clone.dtype, device=accelerator.device)
+                            tensor_gpu.copy_(value_clone, non_blocking=False)
+                            torch.cuda.synchronize(accelerator.device)
+                            max_val_gpu = tensor_gpu.abs().max().item()
+                            
+                            if max_val_gpu > 1e-6:
+                                if step < 3:
+                                    logger.info(f"Step {step}: Method 3 (copy_()) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
+                                return tensor_gpu
+                        except Exception as e:
+                            logger.debug(f"Step {step}: Method 3 (copy_()) failed for {name}: {e}")
+                        
+                        # Method 4: Try chunked transfer (for large tensors)
+                        try:
+                            # Split into chunks and transfer separately
+                            chunk_size = value_clone.numel() // 4  # 4 chunks
+                            if chunk_size > 0:
+                                tensor_gpu = torch.empty(value_clone.shape, dtype=value_clone.dtype, device=accelerator.device)
+                                flat_cpu = value_clone.flatten()
+                                flat_gpu = tensor_gpu.flatten()
+                                
+                                for i in range(0, flat_cpu.numel(), chunk_size):
+                                    end_idx = min(i + chunk_size, flat_cpu.numel())
+                                    flat_gpu[i:end_idx].copy_(flat_cpu[i:end_idx], non_blocking=False)
+                                
+                                torch.cuda.synchronize(accelerator.device)
+                                max_val_gpu = tensor_gpu.abs().max().item()
+                                
+                                if max_val_gpu > 1e-6:
+                                    if step < 3:
+                                        logger.info(f"Step {step}: Method 4 (chunked transfer) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
+                                    return tensor_gpu
+                        except Exception as e:
+                            logger.debug(f"Step {step}: Method 4 (chunked transfer) failed for {name}: {e}")
+                        
+                        # Method 5: Try using torch.tensor constructor on GPU
+                        try:
+                            if step < 3:
+                                logger.warning(f"Step {step}: Trying Method 5 (tensor constructor) for {name}...")
+                            # Convert to numpy, then create tensor directly on GPU
+                            numpy_array = value_clone.cpu().numpy()
+                            tensor_gpu = torch.tensor(numpy_array, dtype=value_clone.dtype, device=accelerator.device)
+                            torch.cuda.synchronize(accelerator.device)
+                            max_val_gpu = tensor_gpu.abs().max().item()
+                            
+                            if step < 3:
+                                logger.warning(f"Step {step}: Method 5 result for {name}: CPU max={max_val_cpu:.6e}, Clone max={max_val_clone:.6e}, GPU max={max_val_gpu:.6e}")
+                            if max_val_gpu > 1e-6:
+                                if step < 3:
+                                    logger.info(f"Step {step}: Method 5 (tensor constructor) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
+                                return tensor_gpu
+                            else:
+                                if step < 3:
+                                    logger.warning(f"Step {step}: Method 5 failed - GPU tensor is zeros")
+                        except Exception as e:
+                            if step < 3:
+                                logger.warning(f"Step {step}: Method 5 (tensor constructor) exception for {name}: {e}")
+                        
+                        # Method 6: Try using CUDA stream for async transfer (skip if hanging)
+                        # Skip this if it's hanging - it's not critical
+                        if step < 3:
+                            try:
+                                logger.warning(f"Step {step}: Trying Method 6 (CUDA stream) for {name}...")
+                                stream = torch.cuda.Stream(device=accelerator.device)
+                                with torch.cuda.stream(stream):
+                                    tensor_gpu = value_clone.to(accelerator.device, non_blocking=True)
+                                stream.synchronize()
+                                max_val_gpu = tensor_gpu.abs().max().item()
+                                
+                                logger.warning(f"Step {step}: Method 6 result for {name}: CPU max={max_val_cpu:.6e}, Clone max={max_val_clone:.6e}, GPU max={max_val_gpu:.6e}")
+                                if max_val_gpu > 1e-6:
+                                    logger.info(f"Step {step}: Method 6 (CUDA stream) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
+                                    return tensor_gpu
+                                else:
+                                    logger.warning(f"Step {step}: Method 6 failed - GPU tensor is zeros")
+                            except Exception as e:
+                                logger.warning(f"Step {step}: Method 6 (CUDA stream) exception for {name}: {e}")
+                        
+                        # Method 7: CRITICAL ROCm WORKAROUND - Direct GPU allocation + element-wise copy
+                        # This bypasses ROCm's broken transfer mechanisms entirely
+                        try:
+                            if step < 3:
+                                logger.warning(f"Step {step}: Trying Method 7 (direct GPU allocation + element copy) for {name}...")
+                            
+                            # Clear GPU cache first to ensure clean allocation
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize(accelerator.device)
+                            
+                            # Allocate tensor directly on GPU
+                            tensor_gpu = torch.empty(value_clone.shape, dtype=value_clone.dtype, device=accelerator.device)
+                            
+                            # Copy data element by element using CPU tensor's data pointer
+                            # This bypasses ROCm's transfer mechanisms
+                            cpu_flat = value_clone.flatten().cpu()
+                            gpu_flat = tensor_gpu.flatten()
+                            
+                            # Use small chunks to avoid memory issues
+                            chunk_size = min(1024 * 1024, cpu_flat.numel())  # 1MB chunks or smaller
+                            for i in range(0, cpu_flat.numel(), chunk_size):
+                                end_idx = min(i + chunk_size, cpu_flat.numel())
+                                # Create a new tensor from the CPU data and transfer
+                                chunk_cpu = cpu_flat[i:end_idx].clone()
+                                gpu_flat[i:end_idx] = chunk_cpu.to(accelerator.device, non_blocking=False)
+                            
+                            torch.cuda.synchronize(accelerator.device)
+                            max_val_gpu = tensor_gpu.abs().max().item()
+                            
+                            if step < 3:
+                                logger.warning(f"Step {step}: Method 7 result for {name}: CPU max={max_val_cpu:.6e}, Clone max={max_val_clone:.6e}, GPU max={max_val_gpu:.6e}")
+                            if max_val_gpu > 1e-6:
+                                if step < 3:
+                                    logger.info(f"Step {step}: Method 7 (direct GPU allocation + element copy) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
+                                return tensor_gpu
+                            else:
+                                if step < 3:
+                                    logger.warning(f"Step {step}: Method 7 failed - GPU tensor is zeros")
+                        except Exception as e:
+                            if step < 3:
+                                logger.warning(f"Step {step}: Method 7 (direct GPU allocation) exception for {name}: {e}")
+                        
+                        # Method 8: Last resort - Use torch.from_numpy with direct GPU placement
+                        try:
+                            if step < 3:
+                                logger.warning(f"Step {step}: Trying Method 8 (numpy + direct GPU) for {name}...")
+                            
+                            # Convert to numpy
+                            numpy_array = value_clone.detach().cpu().numpy()
+                            
+                            # Clear GPU cache
+                            torch.cuda.empty_cache()
+                            
+                            # Create tensor directly on GPU from numpy
+                            # Use torch.as_tensor to avoid copying if possible, but force GPU
+                            tensor_gpu = torch.as_tensor(numpy_array, device=accelerator.device)
+                            
+                            # If that didn't work, try explicit creation
+                            if tensor_gpu.device != accelerator.device:
+                                tensor_gpu = torch.tensor(numpy_array, dtype=value_clone.dtype, device=accelerator.device)
+                            
+                            torch.cuda.synchronize(accelerator.device)
+                            max_val_gpu = tensor_gpu.abs().max().item()
+                            
+                            if step < 3:
+                                logger.warning(f"Step {step}: Method 8 result for {name}: CPU max={max_val_cpu:.6e}, Clone max={max_val_clone:.6e}, GPU max={max_val_gpu:.6e}")
+                            if max_val_gpu > 1e-6:
+                                if step < 3:
+                                    logger.info(f"Step {step}: Method 8 (numpy + direct GPU) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
+                                return tensor_gpu
+                            else:
+                                if step < 3:
+                                    logger.warning(f"Step {step}: Method 8 failed - GPU tensor is zeros")
+                        except Exception as e:
+                            if step < 3:
+                                logger.warning(f"Step {step}: Method 8 (numpy + direct GPU) exception for {name}: {e}")
+                        
+                        # All methods failed - this is a critical ROCm bug
+                        # Before giving up, try one more diagnostic: Can we even create a simple tensor on GPU?
+                        logger.error(f"CRITICAL Step {step}: All transfer methods failed for {name}!")
+                        logger.error(f"  CPU max={max_val_cpu:.6e}, Clone max={max_val_clone:.6e}")
+                        logger.error(f"  This indicates a severe ROCm bug on gfx1151 where CPU→GPU transfer produces zeros.")
+                        
+                        # Diagnostic: Test if GPU can hold any data at all
+                        try:
+                            test_tensor = torch.randn(100, device=accelerator.device)
+                            test_max = test_tensor.abs().max().item()
+                            logger.error(f"  DIAGNOSTIC: GPU can create tensors (test max={test_max:.6e})")
+                            
+                            # Test if we can copy a simple CPU tensor
+                            test_cpu = torch.randn(100, device='cpu')
+                            test_gpu = test_cpu.to(accelerator.device, non_blocking=False)
+                            test_gpu_max = test_gpu.abs().max().item()
+                            logger.error(f"  DIAGNOSTIC: Simple CPU→GPU transfer works (test max={test_gpu_max:.6e})")
+                            
+                            if test_gpu_max > 1e-6:
+                                logger.error(f"  CRITICAL: Simple transfers work, but this specific tensor fails!")
+                                logger.error(f"  Tensor properties: shape={value_clone.shape}, dtype={value_clone.dtype}, contiguous={value_clone.is_contiguous()}")
+                                logger.error(f"  This suggests the issue is tensor-specific (size, shape, or memory layout).")
+                        except Exception as e:
+                            logger.error(f"  DIAGNOSTIC failed: {e}")
+                        
+                        logger.error(f"  Environment: HIP_DISABLE_IPC={os.environ.get('HIP_DISABLE_IPC', 'not set')}")
+                        logger.error(f"  Environment: HSA_OVERRIDE_GFX_VERSION={os.environ.get('HSA_OVERRIDE_GFX_VERSION', 'not set')}")
+                        logger.error(f"  PyTorch version: {torch.__version__}")
+                        logger.error(f"  ROCm version: {torch.version.hip if hasattr(torch.version, 'hip') else 'unknown'}")
+                        logger.error(f"  GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
+                        logger.error(f"  RECOMMENDATION: This is a known ROCm bug. Try:")
+                        logger.error(f"    1. Update ROCm drivers to latest version")
+                        logger.error(f"    2. Use a different ROCm version")
+                        logger.error(f"    3. Load tensors directly to GPU from cache (bypass CPU entirely)")
+                        logger.error(f"    4. Report this bug to AMD/ROCm with this diagnostic information")
+                        raise RuntimeError(f"ROCm bug: Cannot move {name} tensor from CPU to GPU - all values become zeros. This is a critical ROCm bug on gfx1151. All {8} transfer methods failed.")
+                    else:
+                        return value
+                
+                # Move all tensors in batch to GPU
+                # ROCm WORKAROUND: If tensors are already on GPU (loaded directly from cache), skip transfer
+                if batch["latents"].device.type == "cuda":
+                    logger.debug(f"Step {step}: latents already on GPU (loaded directly from cache), skipping transfer")
+                    latents = batch["latents"]
+                else:
+                    latents = move_to_gpu(batch["latents"], "latents")
+                
+                # Also move other tensors that might be needed
+                if "latents_image" in batch:
+                    if batch["latents_image"].device.type == "cuda":
+                        logger.debug(f"Step {step}: latents_image already on GPU, skipping transfer")
+                    else:
+                        batch["latents_image"] = move_to_gpu(batch["latents_image"], "latents_image")
+                if "t5" in batch:
+                    if isinstance(batch["t5"], torch.Tensor) and batch["t5"].device.type == "cuda":
+                        logger.debug(f"Step {step}: t5 already on GPU, skipping transfer")
+                    else:
+                        batch["t5"] = move_to_gpu(batch["t5"], "t5")
+                if "timesteps" in batch and batch["timesteps"] is not None:
+                    if isinstance(batch["timesteps"], torch.Tensor) and batch["timesteps"].device.type == "cuda":
+                        logger.debug(f"Step {step}: timesteps already on GPU, skipping transfer")
+                    else:
+                        batch["timesteps"] = move_to_gpu(batch["timesteps"], "timesteps")
+                
+                # ROCm DIAGNOSTIC: Test GPU random number generator on first step
+                if step == 0:
+                    logger.info("ROCm DIAGNOSTIC: Testing GPU random number generator...")
+                    try:
+                        # Test 1: Direct torch.randn on GPU
+                        test_randn = torch.randn(100, device=accelerator.device)
+                        test_randn_max = test_randn.abs().max().item()
+                        logger.info(f"  Test 1 - torch.randn(100, device='cuda'): max={test_randn_max:.6e}")
+                        if test_randn_max < 1e-6:
+                            logger.error("  CRITICAL: torch.randn produces zeros! GPU random number generator is broken.")
+                        
+                        # Test 2: torch.randn_like on a non-zero tensor
+                        test_ones = torch.ones(100, device=accelerator.device)
+                        test_randn_like = torch.randn_like(test_ones)
+                        test_randn_like_max = test_randn_like.abs().max().item()
+                        logger.info(f"  Test 2 - torch.randn_like(torch.ones(100)): max={test_randn_like_max:.6e}")
+                        if test_randn_like_max < 1e-6:
+                            logger.error("  CRITICAL: torch.randn_like produces zeros! GPU random number generator is broken.")
+                        
+                        # Test 3: Simple GPU operation
+                        test_add = test_ones + 1.0
+                        test_add_sum = test_add.sum().item()
+                        logger.info(f"  Test 3 - Simple GPU operation (ones + 1.0): sum={test_add_sum:.6e} (expected=200.0)")
+                        if abs(test_add_sum - 200.0) > 1e-3:
+                            logger.error(f"  CRITICAL: GPU operations produce wrong results! Expected 200.0, got {test_add_sum:.6e}")
+                        
+                    except Exception as e:
+                        logger.error(f"  ERROR during GPU diagnostic tests: {e}")
+                
+                # Write latents info to file immediately
+                if step < 3:
+                    with open("debug_batch.txt", "a") as f:
+                        max_val = latents.abs().max().item()
+                        f.write(f"Step {step}: After move_to_gpu - latents state:\n")
+                        f.write(f"  shape={latents.shape}, dtype={latents.dtype}, device={latents.device}\n")
+                        f.write(f"  is_contiguous={latents.is_contiguous()}, max={max_val:.6e}\n")
+                        f.write(f"  min={latents.min().item():.6e}, mean={latents.mean().item():.6e}\n")
+                        if torch.cuda.is_available():
+                            allocated = torch.cuda.memory_allocated(accelerator.device) / 1024**3
+                            reserved = torch.cuda.memory_reserved(accelerator.device) / 1024**3
+                            f.write(f"  GPU memory after transfer: allocated={allocated:.2f} GB, reserved={reserved:.2f} GB\n")
+                        if max_val < 1e-6:
+                            f.write(f"  *** CRITICAL: Latents are all zeros after transfer! ***\n")
+                
+                # Debug: Check if latents are all zeros (corrupted cache?)
+                # Log first 10 steps and every 50 steps to catch issues
+                if step < 10 or step % 50 == 0:
+                    # Check device and dtype
+                    latents_device = latents.device
+                    latents_dtype = latents.dtype
+                    latents_stats = f"shape={latents.shape}, dtype={latents_dtype}, device={latents_device}, min={latents.min().item():.6f}, max={latents.max().item():.6f}, mean={latents.mean().item():.6f}"
+                    logger.info(f"DEBUG Step {step}: Raw latents from batch - {latents_stats}")
+                    
+                    # CRITICAL: Check if latents are all zeros
+                    max_val = latents.abs().max().item()
+                    if max_val < 1e-6:
+                        logger.error(f"CRITICAL Step {step}: Latents are all zeros! This means cached latents are corrupted or VAE encoding failed.")
+                        logger.error(f"  Latents device: {latents_device}, dtype: {latents_dtype}")
+                        logger.error(f"  This is a ROCm bug where tensors become zeros when Accelerator moves them to GPU.")
+                        # Try to create a test tensor to see if ROCm randn works
+                        test_tensor = torch.randn_like(latents)
+                        test_max = test_tensor.abs().max().item()
+                        if test_max < 1e-6:
+                            logger.error(f"  CRITICAL: torch.randn_like also produces zeros! This confirms a severe ROCm bug.")
+                        else:
+                            logger.info(f"  torch.randn_like works (max={test_max:.6e}), so the issue is with the latents tensor itself.")
+                    
+                    # Check for Inf/NaN values
+                    if torch.isinf(latents).any() or torch.isnan(latents).any():
+                        logger.error(f"CRITICAL Step {step}: Latents contain Inf or NaN values! This will cause training issues.")
 
                 with accelerator.accumulate(training_model):
                     accelerator.unwrap_model(network).on_step_start()
 
                     latents = self.scale_shift_latents(latents)
+                    
+                    # Debug: Check latents after scaling
+                    if step < 10 or step % 50 == 0:
+                        latents_stats = f"shape={latents.shape}, dtype={latents.dtype}, min={latents.min().item():.6f}, max={latents.max().item():.6f}, mean={latents.mean().item():.6f}"
+                        logger.info(f"DEBUG Step {step}: Latents after scale_shift - {latents_stats}")
+                        
+                        # Detailed memory and device state
+                        if torch.cuda.is_available():
+                            allocated = torch.cuda.memory_allocated(accelerator.device) / 1024**3
+                            reserved = torch.cuda.memory_reserved(accelerator.device) / 1024**3
+                            logger.info(f"DEBUG Step {step}: GPU memory - allocated: {allocated:.2f} GB, reserved: {reserved:.2f} GB")
+                        
+                        if latents.abs().max().item() < 1e-6:
+                            logger.error(f"CRITICAL Step {step}: Latents are all zeros after scale_shift!")
+                            # Check if tensor is contiguous
+                            logger.error(f"  Latents is_contiguous: {latents.is_contiguous()}")
+                            logger.error(f"  Latents device: {latents.device}, dtype: {latents.dtype}")
+                            # Try to check if GPU state is corrupted
+                            test_tensor = torch.randn(10, 10, device=accelerator.device)
+                            test_max = test_tensor.abs().max().item()
+                            logger.error(f"  GPU test tensor max: {test_max:.6e} (should be > 0)")
 
                     # Sample noise that we'll add to the latents
                     noise = torch.randn_like(latents)
+                    
+                    # Debug: Check noise
+                    if step < 10 or step % 50 == 0:
+                        noise_stats = f"shape={noise.shape}, dtype={noise.dtype}, min={noise.min().item():.6f}, max={noise.max().item():.6f}, mean={noise.mean().item():.6f}, std={noise.std().item():.6f}"
+                        logger.info(f"DEBUG Step {step}: Generated noise - {noise_stats}")
+                        if noise.abs().max().item() < 1e-6:
+                            logger.error(f"CRITICAL Step {step}: Noise is all zeros! This should never happen with torch.randn_like.")
 
                     # calculate model input and timesteps
                     noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
                         args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
                     )
+                    
+                    # Debug: Check noisy_model_input and timesteps
+                    if step < 10 or step % 50 == 0:
+                        noisy_stats = f"shape={noisy_model_input.shape}, dtype={noisy_model_input.dtype}, min={noisy_model_input.min().item():.6f}, max={noisy_model_input.max().item():.6f}, mean={noisy_model_input.mean().item():.6f}"
+                        logger.info(f"DEBUG Step {step}: noisy_model_input - {noisy_stats}")
+                        logger.info(f"DEBUG Step {step}: timesteps - shape={timesteps.shape}, dtype={timesteps.dtype}, min={timesteps.min().item():.0f}, max={timesteps.max().item():.0f}")
+                        if noisy_model_input.abs().max().item() < 1e-6:
+                            logger.error(f"CRITICAL Step {step}: noisy_model_input is all zeros!")
 
                     weighting = compute_loss_weighting_for_sd3(
                         args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
                     )
+                    
+                    # Debug: Check weighting
+                    if step < 10 or step % 50 == 0:
+                        if weighting is not None:
+                            weight_stats = f"shape={weighting.shape}, dtype={weighting.dtype}, min={weighting.min().item():.6f}, max={weighting.max().item():.6f}, mean={weighting.mean().item():.6f}"
+                            logger.info(f"DEBUG Step {step}: weighting - {weight_stats}")
 
+                    # CRITICAL: Log before model forward pass
+                    if step < 10 or step % 50 == 0:
+                        logger.info(f"DEBUG Step {step}: About to call model forward pass (call_dit)")
+                        logger.info(f"  latents: shape={latents.shape}, dtype={latents.dtype}, device={latents.device}, max={latents.abs().max().item():.6e}")
+                        logger.info(f"  noise: shape={noise.shape}, dtype={noise.dtype}, device={noise.device}, max={noise.abs().max().item():.6e}")
+                        logger.info(f"  noisy_model_input: shape={noisy_model_input.shape}, dtype={noisy_model_input.dtype}, device={noisy_model_input.device}, max={noisy_model_input.abs().max().item():.6e}")
+                        if torch.cuda.is_available():
+                            allocated = torch.cuda.memory_allocated(accelerator.device) / 1024**3
+                            reserved = torch.cuda.memory_reserved(accelerator.device) / 1024**3
+                            logger.info(f"  GPU memory before forward: allocated={allocated:.2f} GB, reserved={reserved:.2f} GB")
+                    
                     model_pred, target = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
                     )
+                    
+                    # CRITICAL: Log after model forward pass
+                    if step < 10 or step % 50 == 0:
+                        logger.info(f"DEBUG Step {step}: After model forward pass (call_dit)")
+                        logger.info(f"  model_pred: shape={model_pred.shape}, dtype={model_pred.dtype}, device={model_pred.device}, min={model_pred.min().item():.6f}, max={model_pred.max().item():.6f}, mean={model_pred.mean().item():.6f}")
+                        logger.info(f"  target: shape={target.shape}, dtype={target.dtype}, device={target.device}, min={target.min().item():.6f}, max={target.max().item():.6f}, mean={target.mean().item():.6f}")
+                        if model_pred.abs().max().item() < 1e-6:
+                            logger.error(f"CRITICAL Step {step}: model_pred is all zeros after forward pass!")
+                        if target.abs().max().item() < 1e-6:
+                            logger.error(f"CRITICAL Step {step}: target is all zeros after forward pass!")
+                        if torch.cuda.is_available():
+                            allocated = torch.cuda.memory_allocated(accelerator.device) / 1024**3
+                            reserved = torch.cuda.memory_reserved(accelerator.device) / 1024**3
+                            logger.info(f"  GPU memory after forward: allocated={allocated:.2f} GB, reserved={reserved:.2f} GB")
                     loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
 
                     if weighting is not None:
@@ -2194,6 +2739,19 @@ class NetworkTrainer:
                     # loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
                     loss = loss.mean()  # mean loss over all elements in batch
+                    
+                    # Debug: Log raw loss value to diagnose zero loss issue
+                    raw_loss_value = loss.detach().item()
+                    # Always log first 20 steps, then every 50 steps
+                    if step < 20 or step % 50 == 0:
+                        logger.info(f"Step {step}: Raw loss={raw_loss_value:.6f}, model_pred stats: min={model_pred.min().item():.4f}, max={model_pred.max().item():.4f}, mean={model_pred.mean().item():.4f}")
+                        logger.info(f"Step {step}: Target stats: min={target.min().item():.4f}, max={target.max().item():.4f}, mean={target.mean().item():.4f}")
+                    
+                    # Warn if loss is suspiciously low or zero
+                    if raw_loss_value == 0.0:
+                        logger.warning(f"Step {step}: WARNING - Loss is exactly 0.0! This is suspicious. model_pred and target may be identical.")
+                    elif raw_loss_value < 1e-6:
+                        logger.warning(f"Step {step}: WARNING - Loss is very small ({raw_loss_value:.9f}). This may indicate an issue.")
 
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
@@ -2254,6 +2812,24 @@ class NetworkTrainer:
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
+                
+                # Debug: Log loss values to diagnose zero loss issue
+                # Always log first 20 steps, then every 50 steps
+                if global_step < 20 or global_step % 50 == 0:
+                    logger.info(f"Step {global_step}: current_loss={current_loss:.6f}, avr_loss={avr_loss:.6f}, valid_count={loss_recorder.valid_count}, loss_total={loss_recorder.loss_total:.6f}")
+                
+                # Warn if average loss is zero or suspicious
+                if avr_loss == 0.0 and loss_recorder.valid_count > 0:
+                    logger.warning(f"Step {global_step}: WARNING - Average loss is 0.0 but valid_count={loss_recorder.valid_count}. All losses may be exactly 0.0!")
+                elif math.isnan(avr_loss) and loss_recorder.valid_count == 0:
+                    logger.warning(f"Step {global_step}: WARNING - No valid losses recorded (all may be NaN/Inf). valid_count=0, loss_total={loss_recorder.loss_total}")
+                
+                # Debug: Log if loss is NaN/Inf or if average is NaN
+                if math.isnan(current_loss) or math.isinf(current_loss):
+                    logger.warning(f"Step {step}: Loss is {'NaN' if math.isnan(current_loss) else 'Inf'}: {current_loss}")
+                if math.isnan(avr_loss):
+                    logger.warning(f"Step {step}: Average loss is NaN (valid_count={loss_recorder.valid_count}, loss_total={loss_recorder.loss_total})")
+                
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
 
@@ -2302,17 +2878,34 @@ class NetworkTrainer:
         if is_main_process:
             network = accelerator.unwrap_model(network)
 
-        accelerator.end_training()
-        optimizer_eval_fn()
+        # Set default output_dir if not specified
+        if args.output_dir is None:
+            args.output_dir = "."
 
-        if is_main_process and (args.save_state or args.save_state_on_train_end):
-            train_utils.save_state_on_train_end(args, accelerator)
-
+        # Save model BEFORE end_training to avoid ROCm compatibility issues
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
             save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
-
             logger.info("model saved.")
+
+        # Try to clean up, but don't fail if there's a ROCm compatibility issue
+        try:
+            accelerator.end_training()
+        except AttributeError as e:
+            if "is_initialized" in str(e) or "torch.distributed" in str(e):
+                logger.warning(f"ROCm compatibility issue during cleanup (model was saved): {e}")
+            else:
+                raise
+        optimizer_eval_fn()
+
+        if is_main_process and (args.save_state or args.save_state_on_train_end):
+            try:
+                train_utils.save_state_on_train_end(args, accelerator)
+            except AttributeError as e:
+                if "is_initialized" in str(e) or "torch.distributed" in str(e):
+                    logger.warning(f"ROCm compatibility issue during state save: {e}")
+                else:
+                    raise
 
 
 def setup_parser_common() -> argparse.ArgumentParser:
