@@ -20,3 +20,6 @@ src/datasets/
 src/models/
 src/results/
 myface/
+# Debug files
+debug_*.txt
+.lastlibcheck

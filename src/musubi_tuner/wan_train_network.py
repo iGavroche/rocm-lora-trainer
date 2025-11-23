@@ -683,13 +683,15 @@ class WanNetworkTrainer(NetworkTrainer):
     ):
         model: WanModel = transformer
 
+        # Get model dtype - inputs must match model weights dtype, not network_dtype
+        model_dtype = transformer.dtype if hasattr(transformer, 'dtype') else self.dit_dtype
+        
         # I2V training and Control training
         image_latents = None
         clip_fea = None
         if self.i2v_training:
             image_latents = batch["latents_image"]
             # image_latents must match model dtype (dit_dtype), not network_dtype, because it's concatenated with model input
-            model_dtype = transformer.dtype if hasattr(transformer, 'dtype') else self.dit_dtype
             
             # Clamp inf/nan values to prevent numerical instability (silently fix corrupted cached latents)
             # Check before converting to float8, as float8 doesn't support isinf/isnan
@@ -704,7 +706,7 @@ class WanNetworkTrainer(NetworkTrainer):
 
             if not self.config.v2_2:
                 clip_fea = batch["clip"]
-                clip_fea = clip_fea.to(device=accelerator.device, dtype=network_dtype)
+                clip_fea = clip_fea.to(device=accelerator.device, dtype=model_dtype)
 
                 # clip_fea is [B, N, D] (normal) or [B, 1, N, D] (one frame) for I2V, and [B, 2, N, D] for FLF2V, we need to reshape it to [B, N, D] for I2V and [B*2, N, D] for FLF2V
                 if clip_fea.shape[1] == 1:
@@ -736,7 +738,8 @@ class WanNetworkTrainer(NetworkTrainer):
             image_latents = torch.concat([control_latents, image_latents], dim=1)  # B, C, F, H, W
             control_latents = None
 
-        context = [t.to(device=accelerator.device, dtype=network_dtype) for t in batch["t5"]]
+        # model_dtype already defined above
+        context = [t.to(device=accelerator.device, dtype=model_dtype) for t in batch["t5"]]
 
         # ensure the hidden state will require grad
         if args.gradient_checkpointing:
@@ -751,8 +754,10 @@ class WanNetworkTrainer(NetworkTrainer):
         # call DiT
         lat_f, lat_h, lat_w = latents.shape[2:5]
         seq_len = lat_f * lat_h * lat_w // (self.config.patch_size[0] * self.config.patch_size[1] * self.config.patch_size[2])
-        latents = latents.to(device=accelerator.device, dtype=network_dtype)
-        noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=network_dtype)
+        # model_dtype already defined above
+        
+        latents = latents.to(device=accelerator.device, dtype=model_dtype)
+        noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=model_dtype)
         
         # Final check for NaN/Inf in image_latents before model call (I2V specific)
         # This should rarely trigger since we clamp earlier, but serves as a safety net
@@ -769,9 +774,10 @@ class WanNetworkTrainer(NetworkTrainer):
                 else:
                     image_latents = image_latents_check
             
-            # Convert image_latents to network_dtype to match noisy_model_input before concatenation
+            # Convert image_latents to model_dtype to match noisy_model_input before concatenation
             # Float8 cannot be promoted with other types, so we must match dtypes
-            image_latents = image_latents.to(device=accelerator.device, dtype=network_dtype)
+            # model_dtype already defined above
+            image_latents = image_latents.to(device=accelerator.device, dtype=model_dtype)
         
         # Debug: Check if model is in training mode
         if not model.training:

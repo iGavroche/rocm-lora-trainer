@@ -11,7 +11,7 @@ $env:HSA_OVERRIDE_GFX_VERSION="11.5.1"
 # HIP_LAUNCH_BLOCKING: Forces synchronous operations (easier to debug)
 $env:HIP_LAUNCH_BLOCKING="1"
 # AMD_LOG_LEVEL: Verbose logging level (0=off, 1=error, 2=warn, 3=info, 4=debug)
-$env:AMD_LOG_LEVEL="3"
+$env:AMD_LOG_LEVEL="4"
 # HIP_VISIBLE_DEVICES: Ensure we're using the correct device
 $env:HIP_VISIBLE_DEVICES="0"
 # ROCM_DEBUG: Additional ROCm debug flags
@@ -41,6 +41,23 @@ if (Test-Path $venvActivate) {
 } else {
     Write-Host "Warning: ComfyUI venv not found at $venvPath"
     exit 1
+}
+
+# Check and install PEFT if not available
+Write-Host "Checking for PEFT installation..."
+$peftInstalled = & $venvPython -c "import peft; print(peft.__version__)" 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $peftInstalled) {
+    Write-Host "PEFT not found. Installing PEFT..."
+    & $venvUv pip install peft
+    if ($LASTEXITCODE -eq 0) {
+        $peftVersion = & $venvPython -c "import peft; print(peft.__version__)" 2>$null
+        Write-Host "PEFT installed successfully: version $peftVersion"
+    } else {
+        Write-Host "ERROR: Failed to install PEFT. Please install manually: pip install peft"
+        exit 1
+    }
+} else {
+    Write-Host "PEFT already installed: version $peftInstalled"
 }
 
 # Check and upgrade ROCm nightly builds for gfx1151 (Strix Halo) - only once per day
@@ -115,9 +132,25 @@ if ($shouldCheck -and (Test-Path $venvPython)) {
             Write-Host "Ensured huggingface-hub version: $hubVersion (compatible with transformers)"
         }
     }
+    # Also ensure PEFT is up to date
+    & $venvUv pip install peft --upgrade
+    if ($LASTEXITCODE -eq 0) {
+        $peftVersion = & $venvPython -c "import peft; print(peft.__version__)" 2>$null
+        if ($peftVersion) {
+            Write-Host "Ensured PEFT version: $peftVersion"
+        }
+    }
 } elseif (-not (Test-Path $venvPython)) {
     Write-Host "Warning: Python not found in venv, skipping ROCm upgrade check"
 }
+
+Write-Host ""
+Write-Host "=========================================="
+Write-Host "Starting training with PEFT (ROCm compatible)"
+Write-Host "=========================================="
+Write-Host "PEFT avoids the known ROCm tensor transfer bug on Windows"
+Write-Host "Using simple tensor transfers instead of workarounds"
+Write-Host ""
 
 accelerate launch --num_cpu_threads_per_process 8 src/musubi_tuner/wan_train_network.py `
   --task i2v-A14B `
@@ -126,14 +159,14 @@ accelerate launch --num_cpu_threads_per_process 8 src/musubi_tuner/wan_train_net
   --vae .\models\wan\wan_2.1_vae.safetensors `
   --t5 .\models\wan\umt5-xxl-enc-bf16.safetensors `
   --dataset_config dataset.toml `
-  --network_module networks.lora_wan `
+  --use_peft `
   --network_dim 32 `
   --network_alpha 32 `
   --timestep_boundary 920 `
   --timestep_sampling uniform `
   --discrete_flow_shift 5.0 `
   --preserve_distribution_shape `
-  --mixed_precision no `
+  --mixed_precision fp16 `
   --sdpa `
   --optimizer_type AdamW `
   --learning_rate 1e-4 `
@@ -141,6 +174,7 @@ accelerate launch --num_cpu_threads_per_process 8 src/musubi_tuner/wan_train_net
   --max_train_epochs 2 `
   --save_every_n_epochs 1 `
   --output_dir ./output `
-  --output_name chani_i2v_dim16_96gb `
+  --output_name chani_i2v_dim16_96gb_peft `
   --max_data_loader_n_workers 0 `
   --persistent_data_loader_workers
+

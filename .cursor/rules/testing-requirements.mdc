@@ -38,3 +38,17 @@ When you think something "should" work:
 - Run the test and see if it actually works
 - If it fails, analyze why and fix it
 - If it passes, verify it works in the real training context
+
+## "Should" Word Usage - STRICT RULE
+
+**CRITICAL: The word "should" is now a verification commitment**
+
+- NEVER say "should" without having tested/verified it yourself first
+- If you haven't tested it, use phrases like:
+  - "needs to be tested"
+  - "will need verification"
+  - "requires testing to confirm"
+  - "appears to be fixed, but needs verification"
+- Every "should" claim must be backed by actual test results
+- User has experienced 24+ hours of debugging after "should work" claims that didn't work
+- Pattern: Verify first, then say "should" - never the reverse

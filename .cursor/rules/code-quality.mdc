@@ -19,3 +19,11 @@ alwaysApply: true
 - Focus on fixing, not documenting
 - Test everything analytically
 - When you think something "should" work, write a test instead
+
+## "Should" Claims - CRITICAL RULE
+- **NEVER say "should" without verifying it yourself first**
+- Every time you say "should", it means you MUST test/verify it immediately
+- If you can't test it right now, don't say "should" - say "needs to be tested" or "will need verification"
+- The word "should" is a commitment to have verified something yourself
+- User has spent 24+ hours debugging after multiple "should work" claims that didn't work
+- Pattern: Test first, then claim - never claim then test

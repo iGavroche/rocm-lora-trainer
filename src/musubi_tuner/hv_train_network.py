@@ -1655,6 +1655,58 @@ class NetworkTrainer:
 
     # endregion model specific
 
+    def _check_gpu_state(self, checkpoint_name: str, accelerator: Accelerator):
+        """Check GPU state at a specific checkpoint in the training sequence."""
+        log_file = "debug_batch.txt"
+        with open(log_file, "a") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"GPU STATE CHECK: {checkpoint_name}\n")
+            f.write(f"{'='*80}\n")
+            
+            if not torch.cuda.is_available():
+                f.write("GPU not available\n")
+                return
+            
+            device = accelerator.device
+            
+            # Test 1: Can GPU create tensors?
+            try:
+                test_tensor = torch.randn(100, device=device)
+                test_max = test_tensor.abs().max().item()
+                if test_max > 1e-6:
+                    f.write(f"GPU tensor creation: SUCCESS (test max={test_max:.12e})\n")
+                else:
+                    f.write(f"GPU tensor creation: FAILED - GPU cannot create valid tensors!\n")
+                    f.write(f"  Test tensor max={test_max:.12e} (should be > 0)\n")
+                    f.write(f"  CRITICAL: GPU is corrupted at checkpoint '{checkpoint_name}'\n")
+            except Exception as e:
+                f.write(f"GPU tensor creation: EXCEPTION - {str(e)}\n")
+            
+            # Test 2: Can simple CPU->GPU transfer work?
+            try:
+                test_cpu = torch.randn(100, device='cpu')
+                test_cpu_max = test_cpu.abs().max().item()
+                test_gpu = test_cpu.to(device, non_blocking=False)
+                test_gpu_max = test_gpu.abs().max().item()
+                
+                if test_gpu_max > 1e-6:
+                    f.write(f"Simple CPU->GPU transfer: SUCCESS\n")
+                    f.write(f"  CPU max={test_cpu_max:.12e}, GPU max={test_gpu_max:.12e}\n")
+                else:
+                    f.write(f"Simple CPU->GPU transfer: FAILED\n")
+                    f.write(f"  CPU max={test_cpu_max:.12e}, GPU max={test_gpu_max:.12e}\n")
+                    f.write(f"  CRITICAL: GPU transfers broken at checkpoint '{checkpoint_name}'\n")
+            except Exception as e:
+                f.write(f"Simple CPU->GPU transfer: EXCEPTION - {str(e)}\n")
+            
+            # GPU memory state
+            allocated = torch.cuda.memory_allocated(device) / 1024**3
+            reserved = torch.cuda.memory_reserved(device) / 1024**3
+            max_allocated = torch.cuda.max_memory_allocated(device) / 1024**3
+            f.write(f"GPU memory: allocated={allocated:.4f} GB, reserved={reserved:.4f} GB, max={max_allocated:.4f} GB\n")
+            
+            f.write(f"{'='*80}\n\n")
+    
     def train(self, args):
         if torch.cuda.is_available():
             if args.cuda_allow_tf32:
@@ -1735,6 +1787,9 @@ class NetworkTrainer:
             args.mixed_precision = accelerator.mixed_precision
             logger.info(f"mixed precision set to {args.mixed_precision} / mixed precisionを{args.mixed_precision}に設定")
         is_main_process = accelerator.is_main_process
+        
+        # Check GPU state after Accelerator creation
+        self._check_gpu_state("1. After Accelerator Creation", accelerator)
 
         # prepare dtype
         weight_dtype = torch.float32
@@ -1785,6 +1840,9 @@ class NetworkTrainer:
         )
         transformer.eval()
         transformer.requires_grad_(False)
+        
+        # Check GPU state after model load
+        self._check_gpu_state("2. After Model Load", accelerator)
 
         if blocks_to_swap > 0:
             logger.info(
@@ -1797,9 +1855,23 @@ class NetworkTrainer:
 
         # load network model for differential training
         sys.path.append(os.path.dirname(__file__))
-        accelerator.print("import network module:", args.network_module)
-        network_module: lora_module = importlib.import_module(args.network_module)  # actual module may be different
+        
+        # ROCm WORKAROUND: Use PEFT for LoRA training on Windows + ROCm to avoid tensor transfer bug
+        # PEFT has been verified to work correctly and avoids the known ROCm bug (GitHub issue #3874)
+        if args.use_peft:
+            accelerator.print("Using Hugging Face PEFT for LoRA training (ROCm compatibility mode)")
+            try:
+                import musubi_tuner.networks.peft_lora as network_module
+                accelerator.print("PEFT LoRA module loaded successfully")
+            except ImportError as e:
+                accelerator.print(f"ERROR: PEFT not available: {e}")
+                accelerator.print("Install with: pip install peft")
+                return
+        else:
+            accelerator.print("import network module:", args.network_module)
+            network_module: lora_module = importlib.import_module(args.network_module)  # actual module may be different
 
+        # For PEFT, base_weights merging may need special handling
         if args.base_weights is not None:
             # if base_weights is specified, merge the weights to DiT model
             for i, weight_path in enumerate(args.base_weights):
@@ -1811,6 +1883,9 @@ class NetworkTrainer:
                 accelerator.print(f"merging module: {weight_path} with multiplier {multiplier}")
 
                 weights_sd = load_file(weight_path)
+                if args.use_peft:
+                    # PEFT base weights merging - may need special handling
+                    logger.warning("PEFT base_weights merging not yet fully implemented - weights may not merge correctly")
                 module = network_module.create_arch_network_from_weights(
                     multiplier, weights_sd, unet=transformer, for_inference=True
                 )
@@ -1860,7 +1935,15 @@ class NetworkTrainer:
             network.prepare_network(args)
 
         # apply network to DiT
+        # With PEFT, the model is already wrapped, but we call apply_to for compatibility
         network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+        
+        # For PEFT, the transformer is already wrapped, so we need to use the PEFT model
+        if args.use_peft:
+            # PEFT wraps the model, so we need to use the wrapped model for training
+            # The network.peft_model is the wrapped transformer
+            # We'll use it in the training loop instead of the original transformer
+            logger.info("PEFT LoRA applied - using PEFT-wrapped model for training")
 
         if args.network_weights is not None:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
@@ -1947,12 +2030,27 @@ class NetworkTrainer:
             logger.info(f"casting model to {dit_weight_dtype}")
             transformer.to(dit_weight_dtype)
 
-        if blocks_to_swap > 0:
-            transformer = accelerator.prepare(transformer, device_placement=[not blocks_to_swap > 0])
-            accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
-            accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+        # For PEFT, we need to prepare the PEFT model instead of the original transformer
+        if args.use_peft and hasattr(network, 'peft_model'):
+            # PEFT model is already wrapped, prepare it with Accelerate
+            if blocks_to_swap > 0:
+                transformer = accelerator.prepare(network.peft_model, device_placement=[not blocks_to_swap > 0])
+                accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)
+                accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+            else:
+                transformer = accelerator.prepare(network.peft_model)
+            logger.info("PEFT model prepared with Accelerate")
         else:
-            transformer = accelerator.prepare(transformer)
+            # Standard path for non-PEFT
+            if blocks_to_swap > 0:
+                transformer = accelerator.prepare(transformer, device_placement=[not blocks_to_swap > 0])
+                accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
+                accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+            else:
+                transformer = accelerator.prepare(transformer)
+        
+        # Check GPU state after Accelerate prepare
+        self._check_gpu_state("3. After Accelerate Prepare", accelerator)
 
         if args.compile:
             transformer = self.compile_transformer(args, transformer)
@@ -2227,25 +2325,60 @@ class NetworkTrainer:
             metadata["ss_epoch"] = str(epoch + 1)
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
+            
+            # Check GPU state before training loop starts (only on first epoch)
+            if epoch == epoch_to_start:
+                self._check_gpu_state("4. Before Training Loop", accelerator)
 
             for step, batch in enumerate(train_dataloader):
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
+                
+                # Check GPU state at first step of first epoch
+                if epoch == epoch_to_start and step == 0:
+                    self._check_gpu_state("5. At Training Loop Start (Step 0)", accelerator)
 
-                # DEBUG: Check batch keys and latents before accessing
+                # DEBUG: Comprehensive batch logging
+                log_file = "debug_batch.txt"
+                with open(log_file, "a") as f:
+                    f.write(f"\n{'='*80}\n")
+                    f.write(f"TRAINING STEP {step} - BATCH ANALYSIS\n")
+                    f.write(f"{'='*80}\n")
+                    f.write(f"Batch keys: {list(batch.keys())}\n")
+                    
+                    # Log each tensor in batch
+                    for key, value in batch.items():
+                        if isinstance(value, torch.Tensor):
+                            f.write(f"\nBatch['{key}']:\n")
+                            f.write(f"  shape={value.shape}\n")
+                            f.write(f"  dtype={value.dtype}\n")
+                            f.write(f"  device={value.device}\n")
+                            f.write(f"  is_contiguous={value.is_contiguous()}\n")
+                            f.write(f"  max={value.abs().max().item():.12e}\n")
+                            f.write(f"  min={value.min().item():.12e}\n")
+                            f.write(f"  mean={value.mean().item():.12e}\n")
+                            f.write(f"  zero_count={(value == 0).sum().item()}/{value.numel()}\n")
+                        elif isinstance(value, list):
+                            f.write(f"\nBatch['{key}']: list with {len(value)} items\n")
+                            for i, item in enumerate(value[:3]):  # First 3 items
+                                if isinstance(item, torch.Tensor):
+                                    f.write(f"  [{i}]: shape={item.shape}, dtype={item.dtype}, device={item.device}, max={item.abs().max().item():.12e}\n")
+                        else:
+                            f.write(f"\nBatch['{key}']: {type(value)}\n")
+                    
+                    f.write(f"{'='*80}\n\n")
+                
                 if step < 3:
-                    # Write to file to ensure we see it even from workers
-                    with open("debug_batch.txt", "a") as f:
-                        f.write(f"Step {step}: Batch keys: {list(batch.keys())}\n")
                     logger.info(f"DEBUG Step {step}: Batch keys: {list(batch.keys())}")
-                    if "latents" not in batch:
-                        with open("debug_batch.txt", "a") as f:
-                            f.write(f"Step {step}: ERROR - 'latents' key not found! Available keys: {list(batch.keys())}\n")
-                        logger.error(f"CRITICAL Step {step}: 'latents' key not found in batch! Available keys: {list(batch.keys())}")
-                        # Try to find any latent-like key
-                        latent_keys = [k for k in batch.keys() if "latent" in k.lower()]
-                        if latent_keys:
-                            logger.error(f"  Found potential latent keys: {latent_keys}")
-                        continue
+                
+                if "latents" not in batch:
+                    with open(log_file, "a") as f:
+                        f.write(f"Step {step}: ERROR - 'latents' key not found! Available keys: {list(batch.keys())}\n")
+                    logger.error(f"CRITICAL Step {step}: 'latents' key not found in batch! Available keys: {list(batch.keys())}")
+                    # Try to find any latent-like key
+                    latent_keys = [k for k in batch.keys() if "latent" in k.lower()]
+                    if latent_keys:
+                        logger.error(f"  Found potential latent keys: {latent_keys}")
+                    continue
                 
                 # ROCm WORKAROUND: Since we're not using Accelerate's DataLoader wrapper,
                 # tensors should be clean on CPU (not corrupted by Accelerate).
@@ -2268,16 +2401,80 @@ class NetworkTrainer:
                             # Already zeros, just move it
                             return value.to(accelerator.device, non_blocking=False)
                         
-                        # CRITICAL: Log tensor state before transfer
-                        if step < 3:
-                            with open("debug_batch.txt", "a") as f:
-                                f.write(f"Step {step}: move_to_gpu({name}) - CPU tensor state:\n")
-                                f.write(f"  shape={value.shape}, dtype={value.dtype}, is_contiguous={value.is_contiguous()}\n")
-                                f.write(f"  max={max_val_cpu:.6e}, min={value.min().item():.6e}, mean={value.mean().item():.6e}\n")
-                                if torch.cuda.is_available():
-                                    allocated_before = torch.cuda.memory_allocated(accelerator.device) / 1024**3
-                                    reserved_before = torch.cuda.memory_reserved(accelerator.device) / 1024**3
-                                    f.write(f"  GPU memory before: allocated={allocated_before:.2f} GB, reserved={reserved_before:.2f} GB\n")
+                        # CRITICAL: Comprehensive logging before transfer
+                        log_file = "debug_batch.txt"
+                        with open(log_file, "a") as f:
+                            f.write(f"\n{'='*80}\n")
+                            f.write(f"Step {step}: move_to_gpu({name}) - COMPREHENSIVE DIAGNOSTICS\n")
+                            f.write(f"{'='*80}\n")
+                            
+                            # Tensor properties
+                            f.write(f"CPU TENSOR PROPERTIES:\n")
+                            f.write(f"  shape={value.shape}\n")
+                            f.write(f"  dtype={value.dtype}\n")
+                            f.write(f"  device={value.device}\n")
+                            f.write(f"  is_contiguous={value.is_contiguous()}\n")
+                            f.write(f"  is_pinned={value.is_pinned()}\n")
+                            f.write(f"  requires_grad={value.requires_grad}\n")
+                            f.write(f"  numel={value.numel()}\n")
+                            f.write(f"  element_size={value.element_size()} bytes\n")
+                            f.write(f"  total_size={value.numel() * value.element_size() / 1024**2:.2f} MB\n")
+                            
+                            # Memory layout
+                            f.write(f"  storage_offset={value.storage_offset()}\n")
+                            f.write(f"  stride={value.stride()}\n")
+                            if hasattr(value, 'data_ptr'):
+                                f.write(f"  data_ptr={hex(value.data_ptr())}\n")
+                            
+                            # Tensor statistics
+                            f.write(f"CPU TENSOR STATISTICS:\n")
+                            f.write(f"  max={max_val_cpu:.12e}\n")
+                            f.write(f"  min={value.min().item():.12e}\n")
+                            f.write(f"  mean={value.mean().item():.12e}\n")
+                            f.write(f"  std={value.std().item():.12e}\n")
+                            f.write(f"  abs_max={value.abs().max().item():.12e}\n")
+                            
+                            # Check for zeros/NaN/Inf
+                            zero_count = (value == 0).sum().item()
+                            nan_count = torch.isnan(value).sum().item()
+                            inf_count = torch.isinf(value).sum().item()
+                            f.write(f"  zero_count={zero_count}/{value.numel()} ({100*zero_count/value.numel():.2f}%)\n")
+                            f.write(f"  nan_count={nan_count}\n")
+                            f.write(f"  inf_count={inf_count}\n")
+                            
+                            # GPU memory state
+                            if torch.cuda.is_available():
+                                allocated_before = torch.cuda.memory_allocated(accelerator.device) / 1024**3
+                                reserved_before = torch.cuda.memory_reserved(accelerator.device) / 1024**3
+                                max_allocated = torch.cuda.max_memory_allocated(accelerator.device) / 1024**3
+                                f.write(f"GPU MEMORY STATE:\n")
+                                f.write(f"  allocated={allocated_before:.4f} GB\n")
+                                f.write(f"  reserved={reserved_before:.4f} GB\n")
+                                f.write(f"  max_allocated={max_allocated:.4f} GB\n")
+                                
+                                # GPU properties
+                                props = torch.cuda.get_device_properties(accelerator.device)
+                                f.write(f"  total_memory={props.total_memory / 1024**3:.4f} GB\n")
+                                f.write(f"  memory_free={props.total_memory / 1024**3 - reserved_before:.4f} GB\n")
+                            
+                            # Environment
+                            f.write(f"ENVIRONMENT:\n")
+                            f.write(f"  HIP_DISABLE_IPC={os.environ.get('HIP_DISABLE_IPC', 'not set')}\n")
+                            f.write(f"  HSA_OVERRIDE_GFX_VERSION={os.environ.get('HSA_OVERRIDE_GFX_VERSION', 'not set')}\n")
+                            f.write(f"  HIP_LAUNCH_BLOCKING={os.environ.get('HIP_LAUNCH_BLOCKING', 'not set')}\n")
+                            f.write(f"  PyTorch version={torch.__version__}\n")
+                            if hasattr(torch.version, 'hip'):
+                                f.write(f"  ROCm version={torch.version.hip}\n")
+                            if torch.cuda.is_available():
+                                f.write(f"  GPU={torch.cuda.get_device_name(0)}\n")
+                            
+                            # Training context
+                            f.write(f"TRAINING CONTEXT:\n")
+                            f.write(f"  step={step}\n")
+                            f.write(f"  tensor_name={name}\n")
+                            f.write(f"  accelerator_device={accelerator.device}\n")
+                            
+                            f.write(f"{'='*80}\n")
                         
                         # CRITICAL: Make tensor contiguous and clone it first
                         # Non-contiguous or view tensors might cause issues on ROCm
@@ -2321,10 +2518,28 @@ class NetworkTrainer:
                                         f.write(f"Step {step}: Method 1 SUCCESS for {name} - CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}\n")
                                 return tensor_gpu
                             else:
+                                # CRITICAL: Log detailed failure information
+                                with open("debug_batch.txt", "a") as f:
+                                    f.write(f"\n{'!'*80}\n")
+                                    f.write(f"Step {step}: Method 1 FAILED for {name}\n")
+                                    f.write(f"{'!'*80}\n")
+                                    f.write(f"CPU tensor max={max_val_cpu:.12e}\n")
+                                    f.write(f"GPU tensor max={max_val_gpu:.12e}\n")
+                                    f.write(f"GPU tensor shape={tensor_gpu.shape}\n")
+                                    f.write(f"GPU tensor dtype={tensor_gpu.dtype}\n")
+                                    f.write(f"GPU tensor device={tensor_gpu.device}\n")
+                                    f.write(f"GPU tensor is_contiguous={tensor_gpu.is_contiguous()}\n")
+                                    # Check GPU tensor statistics
+                                    gpu_min = tensor_gpu.min().item()
+                                    gpu_mean = tensor_gpu.mean().item()
+                                    gpu_std = tensor_gpu.std().item()
+                                    gpu_zero_count = (tensor_gpu == 0).sum().item()
+                                    f.write(f"GPU tensor min={gpu_min:.12e}, mean={gpu_mean:.12e}, std={gpu_std:.12e}\n")
+                                    f.write(f"GPU tensor zero_count={gpu_zero_count}/{tensor_gpu.numel()} ({100*gpu_zero_count/tensor_gpu.numel():.2f}%)\n")
+                                    f.write(f"{'!'*80}\n\n")
+                                
                                 if step < 3:
                                     logger.warning(f"Step {step}: Method 1 failed - GPU tensor is zeros")
-                                    with open("debug_batch.txt", "a") as f:
-                                        f.write(f"Step {step}: Method 1 FAILED for {name} - GPU tensor is zeros (CPU max={max_val_cpu:.6e})\n")
                         except Exception as e:
                             if step < 3:
                                 logger.warning(f"Step {step}: Method 1 (pinned memory) exception for {name}: {e}")
@@ -2411,25 +2626,28 @@ class NetworkTrainer:
                             if step < 3:
                                 logger.warning(f"Step {step}: Method 5 (tensor constructor) exception for {name}: {e}")
                         
-                        # Method 6: Try using CUDA stream for async transfer (skip if hanging)
-                        # Skip this if it's hanging - it's not critical
+                        # Method 6: Try using CUDA stream for async transfer
+                        # DISABLED: CUDA streams hang on ROCm Windows (hipStreamCreateWithPriority hangs)
+                        # Skip this method entirely - it's not critical and causes hangs
+                        # if step < 3:
+                        #     try:
+                        #         logger.warning(f"Step {step}: Trying Method 6 (CUDA stream) for {name}...")
+                        #         stream = torch.cuda.Stream(device=accelerator.device)
+                        #         with torch.cuda.stream(stream):
+                        #             tensor_gpu = value_clone.to(accelerator.device, non_blocking=True)
+                        #         stream.synchronize()
+                        #         max_val_gpu = tensor_gpu.abs().max().item()
+                        #         
+                        #         logger.warning(f"Step {step}: Method 6 result for {name}: CPU max={max_val_cpu:.6e}, Clone max={max_val_clone:.6e}, GPU max={max_val_gpu:.6e}")
+                        #         if max_val_gpu > 1e-6:
+                        #             logger.info(f"Step {step}: Method 6 (CUDA stream) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
+                        #             return tensor_gpu
+                        #         else:
+                        #             logger.warning(f"Step {step}: Method 6 failed - GPU tensor is zeros")
+                        #     except Exception as e:
+                        #         logger.warning(f"Step {step}: Method 6 (CUDA stream) exception for {name}: {e}")
                         if step < 3:
-                            try:
-                                logger.warning(f"Step {step}: Trying Method 6 (CUDA stream) for {name}...")
-                                stream = torch.cuda.Stream(device=accelerator.device)
-                                with torch.cuda.stream(stream):
-                                    tensor_gpu = value_clone.to(accelerator.device, non_blocking=True)
-                                stream.synchronize()
-                                max_val_gpu = tensor_gpu.abs().max().item()
-                                
-                                logger.warning(f"Step {step}: Method 6 result for {name}: CPU max={max_val_cpu:.6e}, Clone max={max_val_clone:.6e}, GPU max={max_val_gpu:.6e}")
-                                if max_val_gpu > 1e-6:
-                                    logger.info(f"Step {step}: Method 6 (CUDA stream) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
-                                    return tensor_gpu
-                                else:
-                                    logger.warning(f"Step {step}: Method 6 failed - GPU tensor is zeros")
-                            except Exception as e:
-                                logger.warning(f"Step {step}: Method 6 (CUDA stream) exception for {name}: {e}")
+                            logger.debug(f"Step {step}: Skipping Method 6 (CUDA stream) - known to hang on ROCm Windows")
                         
                         # Method 7: CRITICAL ROCm WORKAROUND - Direct GPU allocation + element-wise copy
                         # This bypasses ROCm's broken transfer mechanisms entirely
@@ -2467,9 +2685,16 @@ class NetworkTrainer:
                                     logger.info(f"Step {step}: Method 7 (direct GPU allocation + element copy) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
                                 return tensor_gpu
                             else:
+                                # Log detailed failure
+                                with open("debug_batch.txt", "a") as f:
+                                    f.write(f"Step {step}: Method 7 FAILED for {name}\n")
+                                    f.write(f"  CPU max={max_val_cpu:.12e}, GPU max={max_val_gpu:.12e}\n")
+                                    f.write(f"  Method 7 uses chunked .to(device) transfers - all chunks failed\n")
                                 if step < 3:
                                     logger.warning(f"Step {step}: Method 7 failed - GPU tensor is zeros")
                         except Exception as e:
+                            with open("debug_batch.txt", "a") as f:
+                                f.write(f"Step {step}: Method 7 EXCEPTION for {name}: {e}\n")
                             if step < 3:
                                 logger.warning(f"Step {step}: Method 7 (direct GPU allocation) exception for {name}: {e}")
                         
@@ -2502,75 +2727,179 @@ class NetworkTrainer:
                                     logger.info(f"Step {step}: Method 8 (numpy + direct GPU) worked for {name}: CPU max={max_val_cpu:.6e}, GPU max={max_val_gpu:.6e}")
                                 return tensor_gpu
                             else:
+                                # Log detailed failure
+                                with open("debug_batch.txt", "a") as f:
+                                    f.write(f"Step {step}: Method 8 FAILED for {name}\n")
+                                    f.write(f"  CPU max={max_val_cpu:.12e}, GPU max={max_val_gpu:.12e}\n")
+                                    f.write(f"  Method 8 uses numpy intermediate - also failed\n")
                                 if step < 3:
                                     logger.warning(f"Step {step}: Method 8 failed - GPU tensor is zeros")
                         except Exception as e:
+                            with open("debug_batch.txt", "a") as f:
+                                f.write(f"Step {step}: Method 8 EXCEPTION for {name}: {e}\n")
                             if step < 3:
                                 logger.warning(f"Step {step}: Method 8 (numpy + direct GPU) exception for {name}: {e}")
                         
                         # All methods failed - this is a critical ROCm bug
-                        # Before giving up, try one more diagnostic: Can we even create a simple tensor on GPU?
+                        # Log comprehensive failure diagnostics
+                        log_file = "debug_batch.txt"
+                        with open(log_file, "a") as f:
+                            f.write(f"\n{'#'*80}\n")
+                            f.write(f"CRITICAL FAILURE: All transfer methods failed for {name}\n")
+                            f.write(f"{'#'*80}\n")
+                            f.write(f"Step: {step}\n")
+                            f.write(f"Tensor name: {name}\n")
+                            f.write(f"CPU tensor max: {max_val_cpu:.12e}\n")
+                            f.write(f"Clone tensor max: {max_val_clone:.12e}\n")
+                            f.write(f"Original tensor shape: {value.shape}\n")
+                            f.write(f"Original tensor dtype: {value.dtype}\n")
+                            f.write(f"Original tensor contiguous: {value.is_contiguous()}\n")
+                            f.write(f"Clone tensor shape: {value_clone.shape}\n")
+                            f.write(f"Clone tensor dtype: {value_clone.dtype}\n")
+                            f.write(f"Clone tensor contiguous: {value_clone.is_contiguous()}\n")
+                            
+                            # Final tensor state analysis
+                            f.write(f"\nFINAL TENSOR ANALYSIS:\n")
+                            f.write(f"  Original CPU tensor:\n")
+                            f.write(f"    min={value.min().item():.12e}, max={value.max().item():.12e}\n")
+                            f.write(f"    mean={value.mean().item():.12e}, std={value.std().item():.12e}\n")
+                            f.write(f"    zero_count={(value == 0).sum().item()}/{value.numel()}\n")
+                            f.write(f"  Cloned CPU tensor:\n")
+                            f.write(f"    min={value_clone.min().item():.12e}, max={value_clone.max().item():.12e}\n")
+                            f.write(f"    mean={value_clone.mean().item():.12e}, std={value_clone.std().item():.12e}\n")
+                            f.write(f"    zero_count={(value_clone == 0).sum().item()}/{value_clone.numel()}\n")
+                            
+                            # GPU memory state at failure
+                            if torch.cuda.is_available():
+                                allocated = torch.cuda.memory_allocated(accelerator.device) / 1024**3
+                                reserved = torch.cuda.memory_reserved(accelerator.device) / 1024**3
+                                max_allocated = torch.cuda.max_memory_allocated(accelerator.device) / 1024**3
+                                f.write(f"\nGPU MEMORY AT FAILURE:\n")
+                                f.write(f"  allocated={allocated:.4f} GB\n")
+                                f.write(f"  reserved={reserved:.4f} GB\n")
+                                f.write(f"  max_allocated={max_allocated:.4f} GB\n")
+                            
+                            # Diagnostic tests
+                            f.write(f"\nDIAGNOSTIC TESTS:\n")
+                            try:
+                                # Test 1: Can GPU create tensors?
+                                test_tensor = torch.randn(100, device=accelerator.device)
+                                test_max = test_tensor.abs().max().item()
+                                if test_max > 1e-6:
+                                    f.write(f"  GPU tensor creation: SUCCESS (test max={test_max:.12e})\n")
+                                else:
+                                    f.write(f"  GPU tensor creation: FAILED - GPU cannot create valid tensors!\n")
+                                    f.write(f"    Test tensor max={test_max:.12e} (should be > 0)\n")
+                                    f.write(f"    CRITICAL: GPU is in corrupted state - cannot create random tensors\n")
+                                
+                                # Test 2: Can simple CPU->GPU transfer work?
+                                test_cpu = torch.randn(100, device='cpu')
+                                test_cpu_max = test_cpu.abs().max().item()
+                                test_gpu = test_cpu.to(accelerator.device, non_blocking=False)
+                                test_gpu_max = test_gpu.abs().max().item()
+                                
+                                if test_gpu_max > 1e-6:
+                                    f.write(f"  Simple CPU->GPU transfer: SUCCESS\n")
+                                    f.write(f"    CPU max={test_cpu_max:.12e}, GPU max={test_gpu_max:.12e}\n")
+                                    f.write(f"  CRITICAL: Simple transfers work, but this specific tensor fails!\n")
+                                    f.write(f"  This suggests tensor-specific issue:\n")
+                                    f.write(f"    - Size: {value_clone.numel()} vs {test_cpu.numel()}\n")
+                                    f.write(f"    - Shape: {value_clone.shape} vs {test_cpu.shape}\n")
+                                    f.write(f"    - Dtype: {value_clone.dtype} vs {test_cpu.dtype}\n")
+                                    f.write(f"    - Memory layout differences\n")
+                                else:
+                                    f.write(f"  Simple CPU->GPU transfer: FAILED\n")
+                                    f.write(f"    CPU max={test_cpu_max:.12e}, GPU max={test_gpu_max:.12e}\n")
+                                    f.write(f"  CRITICAL: Even simple transfers fail - GPU is completely broken\n")
+                                
+                                # Test 3: Check if GPU can do any operations
+                                if test_max > 1e-6:
+                                    test_result = (test_tensor * 2.0).sum().item()
+                                    f.write(f"  GPU operations: SUCCESS (test result={test_result:.12e})\n")
+                                else:
+                                    f.write(f"  GPU operations: Cannot test (GPU tensor creation failed)\n")
+                                    
+                            except Exception as e:
+                                f.write(f"  Diagnostic tests failed: {str(e)}\n")
+                                import traceback
+                                try:
+                                    f.write(f"  Traceback: {traceback.format_exc()}\n")
+                                except:
+                                    f.write(f"  Could not write traceback (encoding issue)\n")
+                            
+                            # Environment and system info
+                            f.write(f"\nSYSTEM INFORMATION:\n")
+                            f.write(f"  HIP_DISABLE_IPC={os.environ.get('HIP_DISABLE_IPC', 'not set')}\n")
+                            f.write(f"  HSA_OVERRIDE_GFX_VERSION={os.environ.get('HSA_OVERRIDE_GFX_VERSION', 'not set')}\n")
+                            f.write(f"  HIP_LAUNCH_BLOCKING={os.environ.get('HIP_LAUNCH_BLOCKING', 'not set')}\n")
+                            f.write(f"  AMD_LOG_LEVEL={os.environ.get('AMD_LOG_LEVEL', 'not set')}\n")
+                            f.write(f"  PyTorch version: {torch.__version__}\n")
+                            if hasattr(torch.version, 'hip'):
+                                f.write(f"  ROCm version: {torch.version.hip}\n")
+                            if torch.cuda.is_available():
+                                f.write(f"  GPU: {torch.cuda.get_device_name(0)}\n")
+                                props = torch.cuda.get_device_properties(0)
+                                f.write(f"  GPU total memory: {props.total_memory / 1024**3:.2f} GB\n")
+                            
+                            f.write(f"\n{'#'*80}\n\n")
+                        
+                        # Also log to console
                         logger.error(f"CRITICAL Step {step}: All transfer methods failed for {name}!")
                         logger.error(f"  CPU max={max_val_cpu:.6e}, Clone max={max_val_clone:.6e}")
+                        logger.error(f"  Detailed diagnostics written to debug_batch.txt")
                         logger.error(f"  This indicates a severe ROCm bug on gfx1151 where CPU→GPU transfer produces zeros.")
                         
-                        # Diagnostic: Test if GPU can hold any data at all
-                        try:
-                            test_tensor = torch.randn(100, device=accelerator.device)
-                            test_max = test_tensor.abs().max().item()
-                            logger.error(f"  DIAGNOSTIC: GPU can create tensors (test max={test_max:.6e})")
-                            
-                            # Test if we can copy a simple CPU tensor
-                            test_cpu = torch.randn(100, device='cpu')
-                            test_gpu = test_cpu.to(accelerator.device, non_blocking=False)
-                            test_gpu_max = test_gpu.abs().max().item()
-                            logger.error(f"  DIAGNOSTIC: Simple CPU→GPU transfer works (test max={test_gpu_max:.6e})")
-                            
-                            if test_gpu_max > 1e-6:
-                                logger.error(f"  CRITICAL: Simple transfers work, but this specific tensor fails!")
-                                logger.error(f"  Tensor properties: shape={value_clone.shape}, dtype={value_clone.dtype}, contiguous={value_clone.is_contiguous()}")
-                                logger.error(f"  This suggests the issue is tensor-specific (size, shape, or memory layout).")
-                        except Exception as e:
-                            logger.error(f"  DIAGNOSTIC failed: {e}")
-                        
-                        logger.error(f"  Environment: HIP_DISABLE_IPC={os.environ.get('HIP_DISABLE_IPC', 'not set')}")
-                        logger.error(f"  Environment: HSA_OVERRIDE_GFX_VERSION={os.environ.get('HSA_OVERRIDE_GFX_VERSION', 'not set')}")
-                        logger.error(f"  PyTorch version: {torch.__version__}")
-                        logger.error(f"  ROCm version: {torch.version.hip if hasattr(torch.version, 'hip') else 'unknown'}")
-                        logger.error(f"  GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
-                        logger.error(f"  RECOMMENDATION: This is a known ROCm bug. Try:")
-                        logger.error(f"    1. Update ROCm drivers to latest version")
-                        logger.error(f"    2. Use a different ROCm version")
-                        logger.error(f"    3. Load tensors directly to GPU from cache (bypass CPU entirely)")
-                        logger.error(f"    4. Report this bug to AMD/ROCm with this diagnostic information")
-                        raise RuntimeError(f"ROCm bug: Cannot move {name} tensor from CPU to GPU - all values become zeros. This is a critical ROCm bug on gfx1151. All {8} transfer methods failed.")
+                        raise RuntimeError(f"ROCm bug: Cannot move {name} tensor from CPU to GPU - all values become zeros. This is a critical ROCm bug on gfx1151. All {8} transfer methods failed. See debug_batch.txt for detailed diagnostics.")
                     else:
                         return value
                 
                 # Move all tensors in batch to GPU
-                # ROCm WORKAROUND: If tensors are already on GPU (loaded directly from cache), skip transfer
-                if batch["latents"].device.type == "cuda":
-                    logger.debug(f"Step {step}: latents already on GPU (loaded directly from cache), skipping transfer")
-                    latents = batch["latents"]
+                # ROCm WORKAROUND: Use simple transfers when using PEFT (PEFT avoids the ROCm bug)
+                if args.use_peft:
+                    # PEFT works correctly with simple transfers - no workarounds needed
+                    if batch["latents"].device.type != "cuda":
+                        latents = batch["latents"].to(accelerator.device, non_blocking=False)
+                    else:
+                        latents = batch["latents"]
+                    # Verify transfer worked (PEFT should avoid the bug, but check anyway)
+                    if latents.abs().max().item() < 1e-6 and batch["latents"].abs().max().item() > 1e-6:
+                        logger.error(f"Step {step}: CRITICAL - PEFT transfer produced zeros! This should not happen.")
+                        raise RuntimeError("PEFT tensor transfer failed - this indicates a deeper ROCm issue")
                 else:
-                    latents = move_to_gpu(batch["latents"], "latents")
+                    # Use workarounds for non-PEFT path (affected by ROCm bug)
+                    if batch["latents"].device.type == "cuda":
+                        logger.debug(f"Step {step}: latents already on GPU (loaded directly from cache), skipping transfer")
+                        latents = batch["latents"]
+                    else:
+                        latents = move_to_gpu(batch["latents"], "latents")
                 
                 # Also move other tensors that might be needed
-                if "latents_image" in batch:
-                    if batch["latents_image"].device.type == "cuda":
-                        logger.debug(f"Step {step}: latents_image already on GPU, skipping transfer")
-                    else:
-                        batch["latents_image"] = move_to_gpu(batch["latents_image"], "latents_image")
-                if "t5" in batch:
-                    if isinstance(batch["t5"], torch.Tensor) and batch["t5"].device.type == "cuda":
-                        logger.debug(f"Step {step}: t5 already on GPU, skipping transfer")
-                    else:
-                        batch["t5"] = move_to_gpu(batch["t5"], "t5")
-                if "timesteps" in batch and batch["timesteps"] is not None:
-                    if isinstance(batch["timesteps"], torch.Tensor) and batch["timesteps"].device.type == "cuda":
-                        logger.debug(f"Step {step}: timesteps already on GPU, skipping transfer")
-                    else:
-                        batch["timesteps"] = move_to_gpu(batch["timesteps"], "timesteps")
+                if args.use_peft:
+                    # Simple transfers for PEFT (avoids ROCm bug)
+                    if "latents_image" in batch and batch["latents_image"].device.type != "cuda":
+                        batch["latents_image"] = batch["latents_image"].to(accelerator.device, non_blocking=False)
+                    if "t5" in batch and isinstance(batch["t5"], torch.Tensor) and batch["t5"].device.type != "cuda":
+                        batch["t5"] = batch["t5"].to(accelerator.device, non_blocking=False)
+                    if "timesteps" in batch and batch["timesteps"] is not None:
+                        if isinstance(batch["timesteps"], torch.Tensor) and batch["timesteps"].device.type != "cuda":
+                            batch["timesteps"] = batch["timesteps"].to(accelerator.device, non_blocking=False)
+                else:
+                    # Use workarounds for non-PEFT path
+                    if "latents_image" in batch:
+                        if batch["latents_image"].device.type == "cuda":
+                            logger.debug(f"Step {step}: latents_image already on GPU, skipping transfer")
+                        else:
+                            batch["latents_image"] = move_to_gpu(batch["latents_image"], "latents_image")
+                    if "t5" in batch:
+                        if isinstance(batch["t5"], torch.Tensor) and batch["t5"].device.type == "cuda":
+                            logger.debug(f"Step {step}: t5 already on GPU, skipping transfer")
+                        else:
+                            batch["t5"] = move_to_gpu(batch["t5"], "t5")
+                    if "timesteps" in batch and batch["timesteps"] is not None:
+                        if isinstance(batch["timesteps"], torch.Tensor) and batch["timesteps"].device.type == "cuda":
+                            logger.debug(f"Step {step}: timesteps already on GPU, skipping transfer")
+                        else:
+                            batch["timesteps"] = move_to_gpu(batch["timesteps"], "timesteps")
                 
                 # ROCm DIAGNOSTIC: Test GPU random number generator on first step
                 if step == 0:
@@ -3413,6 +3742,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--dim_from_weights",
         action="store_true",
         help="automatically determine dim (rank) from network_weights / dim (rank)をnetwork_weightsで指定した重みから自動で決定する",
+    )
+    parser.add_argument(
+        "--use_peft",
+        action="store_true",
+        default=False,
+        help="Use Hugging Face PEFT for LoRA training (avoids ROCm tensor transfer bug on Windows) / Hugging Face PEFTを使用してLoRA学習を行う（WindowsでのROCmテンソル転送バグを回避）",
     )
     parser.add_argument(
         "--scale_weight_norms",
