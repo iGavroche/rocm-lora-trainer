@@ -244,6 +244,36 @@ Run `accelerate config` to configure Accelerate. Choose appropriate values for e
 
 Training and inference procedures vary significantly by architecture. Please refer to the architecture-specific documents in the [Documentation](#documentation) section and the various configuration documents for detailed instructions.
 
+#### Example: WAN 2.2 I2V LoRA Training
+
+For a complete example of training a LoRA with WAN 2.2 I2V, see the training scripts in the repository root:
+
+- **Linux/Mac**: `train_chani_full.sh` - Bash script for WAN 2.2 I2V LoRA training
+- **Windows**: `train_chani_full.ps1` - PowerShell wrapper that calls the bash script via WSL or Git Bash
+
+These scripts include:
+- ROCm stability optimizations (HSA_XNACK=0, kernel parameters)
+- Proper attention mechanism selection (SDPA for compatibility)
+- Gradient checkpointing for stability
+- Resume functionality for interrupted training
+
+**ROCm Setup (AMD GPUs):**
+
+For RDNA3.5 GPUs (e.g., Strix Halo) on ROCm, additional stability fixes may be needed:
+
+1. **Environment Variable** (applied automatically in scripts):
+   ```bash
+   export HSA_XNACK=0
+   ```
+
+2. **Kernel Parameters** (requires reboot):
+   ```bash
+   ./apply_rocm_kernel_params.sh
+   ```
+   This adds: `amdgpu.noretry=0 amdgpu.gpu_recovery=1 amdgpu.isolation=0`
+
+See `train_chani_full.sh` and `apply_rocm_kernel_params.sh` for implementation details.
+
 ## Miscellaneous
 
 ### SageAttention Installation

@@ -2,6 +2,7 @@ __pycache__/
 .venv
 venv/
 logs/
+*.log
 uv.lock
 main.exp
 main.lib
@@ -13,3 +14,54 @@ GEMINI.md
 AGENTS.md
 .vscode/settings.json
 .mcp.json
+
+# Training outputs and checkpoints
+outputs/
+*.safetensors
+*-state/
+*-state*/
+
+# Model files (too large for git)
+models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+
+# Dataset and cache files
+myface/
+*.safetensors
+*_cache/
+*_latents/
+*_te.safetensors
+*_wan.safetensors
+*_wan_te.safetensors
+
+# Python cache
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*~
