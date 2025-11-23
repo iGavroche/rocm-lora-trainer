@@ -3093,7 +3093,12 @@ class NetworkTrainer:
 
                         if args.max_grad_norm != 0.0:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                            # For fp16 mixed precision, use direct clipping instead of accelerator's scaler
+                            # Accelerator's clip_grad_norm_ tries to unscale fp16 gradients which isn't supported
+                            if args.mixed_precision == "fp16":
+                                torch.nn.utils.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                            else:
+                                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     optimizer.step()
                     lr_scheduler.step()
