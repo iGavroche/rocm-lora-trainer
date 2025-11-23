@@ -2086,15 +2086,16 @@ class NetworkTrainer:
 
         accelerator.unwrap_model(network).prepare_grad_etc(transformer)
 
-        if args.full_fp16:
-            # patch accelerator for fp16 training
-            # def patch_accelerator_for_fp16_training(accelerator):
-            org_unscale_grads = accelerator.scaler._unscale_grads_
+        # Patch accelerator scaler for fp16 training (both full_fp16 and mixed_precision fp16)
+        # The scaler tries to unscale fp16 gradients which isn't supported, so we need to allow it
+        if args.full_fp16 or args.mixed_precision == "fp16":
+            if accelerator.scaler is not None:
+                org_unscale_grads = accelerator.scaler._unscale_grads_
 
-            def _unscale_grads_replacer(optimizer, inv_scale, found_inf, allow_fp16):
-                return org_unscale_grads(optimizer, inv_scale, found_inf, True)
+                def _unscale_grads_replacer(optimizer, inv_scale, found_inf, allow_fp16):
+                    return org_unscale_grads(optimizer, inv_scale, found_inf, True)
 
-            accelerator.scaler._unscale_grads_ = _unscale_grads_replacer
+                accelerator.scaler._unscale_grads_ = _unscale_grads_replacer
 
         # before resuming make hook for saving/loading to save/load the network weights only
         def save_model_hook(models, weights, output_dir):
