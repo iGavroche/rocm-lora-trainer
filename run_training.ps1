@@ -7,27 +7,27 @@ $env:HIP_DISABLE_IPC="1"
 # This ensures ROCm uses the correct GPU architecture
 $env:HSA_OVERRIDE_GFX_VERSION="11.5.1"
 
-# ROCm Verbose Logging - Enable detailed ROCm/HIP logging
-# HIP_LAUNCH_BLOCKING: Forces synchronous operations (easier to debug)
-$env:HIP_LAUNCH_BLOCKING="1"
-# AMD_LOG_LEVEL: Verbose logging level (0=off, 1=error, 2=warn, 3=info, 4=debug)
-$env:AMD_LOG_LEVEL="3"
+# ROCm Configuration
+# HIP_LAUNCH_BLOCKING: Disable for better performance (set to "1" for debugging)
+$env:HIP_LAUNCH_BLOCKING="0"
+# AMD_LOG_LEVEL: Logging level (0=off, 1=error, 2=warn, 3=info, 4=debug)
+$env:AMD_LOG_LEVEL="1"
 # HIP_VISIBLE_DEVICES: Ensure we're using the correct device
 $env:HIP_VISIBLE_DEVICES="0"
-# ROCM_DEBUG: Additional ROCm debug flags
-$env:ROCM_DEBUG="1"
-# HIP_PROFILE: Enable HIP profiling
-$env:HIP_PROFILE="1"
+# ROCM_DEBUG: Additional ROCm debug flags (disable for performance)
+$env:ROCM_DEBUG="0"
+# HIP_PROFILE: Disable HIP profiling for performance
+$env:HIP_PROFILE="0"
 
-# PyTorch Verbose Logging - Enable PyTorch debug output
-# TORCH_LOGS: Enable PyTorch logging (comma-separated list of modules)
-$env:TORCH_LOGS="+dynamo,+inductor,+autograd,+distributed"
-# TORCH_SHOW_CPP_STACKTRACES: Show C++ stack traces
-$env:TORCH_SHOW_CPP_STACKTRACES="1"
-# TORCH_USE_CUDA_DSA: Enable CUDA Device-Side Assertions (for ROCm compatibility)
-$env:TORCH_USE_CUDA_DSA="1"
-# PYTORCH_CUDA_ALLOC_DEBUG: Enable CUDA memory allocation debugging
-$env:PYTORCH_CUDA_ALLOC_DEBUG="1"
+# PyTorch Configuration - Reduced logging for performance
+# TORCH_LOGS: Minimal logging (set to "+dynamo,+inductor,+autograd,+distributed" for debugging)
+$env:TORCH_LOGS=""
+# TORCH_SHOW_CPP_STACKTRACES: Disable for performance
+$env:TORCH_SHOW_CPP_STACKTRACES="0"
+# TORCH_USE_CUDA_DSA: Disable for performance
+$env:TORCH_USE_CUDA_DSA="0"
+# PYTORCH_CUDA_ALLOC_DEBUG: Disable for performance
+$env:PYTORCH_CUDA_ALLOC_DEBUG="0"
 
 # Activate ComfyUI virtual environment
 $venvPath = "..\..\ComfyUI\.venv"
@@ -119,23 +119,22 @@ if ($shouldCheck -and (Test-Path $venvPython)) {
     Write-Host "Warning: Python not found in venv, skipping ROCm upgrade check"
 }
 
-accelerate launch --num_cpu_threads_per_process 8 src/musubi_tuner/wan_train_network.py `
+accelerate launch --num_cpu_threads_per_process 1 src/musubi_tuner/wan_train_network.py `
   --task i2v-A14B `
   --dit .\models\wan\wan2.2_i2v_low_noise_14B_fp16.safetensors `
-  --dit_high_noise .\models\wan\wan2.2_i2v_high_noise_14B_fp16.safetensors `
   --vae .\models\wan\wan_2.1_vae.safetensors `
   --t5 .\models\wan\umt5-xxl-enc-bf16.safetensors `
   --dataset_config dataset.toml `
   --network_module networks.lora_wan `
   --network_dim 32 `
   --network_alpha 32 `
-  --timestep_boundary 920 `
+  --timestep_boundary 900 `
   --timestep_sampling uniform `
   --discrete_flow_shift 5.0 `
   --preserve_distribution_shape `
-  --mixed_precision no `
+  --mixed_precision fp16 `
   --sdpa `
-  --optimizer_type AdamW `
+  --optimizer_type adamw8bit `
   --learning_rate 1e-4 `
   --gradient_checkpointing `
   --max_train_epochs 2 `
@@ -143,4 +142,3 @@ accelerate launch --num_cpu_threads_per_process 8 src/musubi_tuner/wan_train_net
   --output_dir ./output `
   --output_name chani_i2v_dim16_96gb `
   --max_data_loader_n_workers 0 `
-  --persistent_data_loader_workers

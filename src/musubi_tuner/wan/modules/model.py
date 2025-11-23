@@ -175,7 +175,18 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return super().forward(x.float()).type_as(x)
+        # Convert input to float32 for layer_norm, and convert weights if they exist
+        x_float = x.float()
+        if self.elementwise_affine:
+            # Use functional layer_norm with converted weights
+            weight_float = self.weight.float() if self.weight is not None else None
+            bias_float = self.bias.float() if self.bias is not None else None
+            result = torch.nn.functional.layer_norm(
+                x_float, self.normalized_shape, weight_float, bias_float, self.eps
+            ).type_as(x)
+        else:
+            result = super().forward(x_float).type_as(x)
+        return result
 
 
 class WanSelfAttention(nn.Module):
