@@ -40,7 +40,7 @@ python wan_cache_latents.py `
   --vae .\models\wan\wan_2.1_vae.safetensors `
   --i2v `
   --batch_size 1 `
-  --num_workers 0 `
+  --num_workers 1 `
   --vae_dtype float32 `
   --skip_existing
 

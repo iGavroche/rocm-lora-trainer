@@ -36,6 +36,6 @@ python wan_cache_text_encoder_outputs.py `
   --dataset_config dataset.toml `
   --t5 .\models\wan\umt5-xxl-enc-bf16.safetensors `
   --batch_size 1 `
-  --num_workers 0 `
+  --num_workers 1 `
   --skip_existing
 

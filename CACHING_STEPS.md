@@ -53,7 +53,7 @@ python wan_cache_latents.py `
   --vae .\models\wan\wan_2.1_vae.safetensors `
   --i2v `
   --batch_size 1 `
-  --num_workers 0 `
+  --num_workers 1 `
   --vae_dtype float32 `
   --skip_existing
 ```
@@ -84,7 +84,7 @@ python wan_cache_text_encoder_outputs.py `
   --dataset_config dataset.toml `
   --t5 .\models\wan\umt5-xxl-enc-bf16.safetensors `
   --batch_size 1 `
-  --num_workers 0 `
+  --num_workers 1 `
   --skip_existing
 ```
 
@@ -108,7 +108,7 @@ python check_cache.py --dataset_config dataset.toml
 
 ## Important Notes
 
-1. **Windows + ROCm**: Always use `--num_workers 0` (required for Windows multiprocessing with ROCm)
+1. **Windows + ROCm**: Use `--num_workers 1` (ThreadPoolExecutor uses threads, not multiprocessing, so 1 worker is safe)
 
 2. **VAE Dtype**: The script automatically uses `float32` for VAE on ROCm to avoid bfloat16 bugs. This is correct.
 
