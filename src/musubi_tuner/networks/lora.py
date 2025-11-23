@@ -55,6 +55,9 @@ class LoRAModule(torch.nn.Module):
         self.lora_dim = lora_dim
         self.split_dims = split_dims
 
+        # Get dtype from original module to match it
+        org_dtype = org_module.weight.dtype if hasattr(org_module, 'weight') else torch.float32
+
         if split_dims is None:
             if org_module.__class__.__name__ == "Conv2d":
                 kernel_size = org_module.kernel_size
@@ -65,6 +68,10 @@ class LoRAModule(torch.nn.Module):
             else:
                 self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
                 self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
+
+            # Match dtype of original module
+            self.lora_down = self.lora_down.to(dtype=org_dtype)
+            self.lora_up = self.lora_up.to(dtype=org_dtype)
 
             torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
             torch.nn.init.zeros_(self.lora_up.weight)
@@ -77,9 +84,12 @@ class LoRAModule(torch.nn.Module):
                 [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
             )
             self.lora_up = torch.nn.ModuleList([torch.nn.Linear(self.lora_dim, split_dim, bias=False) for split_dim in split_dims])
+            # Match dtype of original module
             for lora_down in self.lora_down:
+                lora_down.to(dtype=org_dtype)
                 torch.nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
             for lora_up in self.lora_up:
+                lora_up.to(dtype=org_dtype)
                 torch.nn.init.zeros_(lora_up.weight)
 
         if type(alpha) == torch.Tensor:
