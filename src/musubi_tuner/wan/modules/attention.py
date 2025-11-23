@@ -93,6 +93,12 @@ def flash_attention(
         k = half(k.transpose(1, 2))
         v = half(v.transpose(1, 2))
 
+        # Numerical stability: Clamp extreme values before attention to prevent NaN in fp16
+        # This is especially important on ROCm where fp16 has known numerical instability issues
+        q = torch.clamp(q, min=-50.0, max=50.0)
+        k = torch.clamp(k, min=-50.0, max=50.0)
+        v = torch.clamp(v, min=-50.0, max=50.0)
+
         if not split_attn:
             q = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, is_causal=causal, dropout_p=dropout_p, scale=softmax_scale

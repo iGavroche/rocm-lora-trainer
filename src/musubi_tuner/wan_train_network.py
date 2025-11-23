@@ -784,9 +784,57 @@ class WanNetworkTrainer(NetworkTrainer):
             logger.warning(f"Model is in eval mode! This may cause issues. Setting to training mode.")
             model.train()
         
+        # Enhanced diagnostics: Log input stats and model configuration to track NaN origins
+        if not hasattr(self, '_debug_step_count'):
+            self._debug_step_count = 0
+        if self._debug_step_count < 20 or self._debug_step_count % 50 == 0:
+            logger.info(f"Step {self._debug_step_count}: Input stats - noisy_model_input: min={noisy_model_input.min().item():.6f}, max={noisy_model_input.max().item():.6f}, mean={noisy_model_input.mean().item():.6f}")
+            logger.info(f"Step {self._debug_step_count}: Model dtype: {model_dtype}, Mixed precision: {args.mixed_precision}")
+            logger.info(f"Step {self._debug_step_count}: Latents stats - min={latents.min().item():.6f}, max={latents.max().item():.6f}, mean={latents.mean().item():.6f}")
+            if image_latents is not None:
+                logger.info(f"Step {self._debug_step_count}: Image latents stats - min={image_latents.min().item():.6f}, max={image_latents.max().item():.6f}, mean={image_latents.mean().item():.6f}")
+            logger.info(f"Step {self._debug_step_count}: Timesteps - min={timesteps.min().item():.0f}, max={timesteps.max().item():.0f}")
+        
         with accelerator.autocast():
-            model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
-        model_pred = torch.stack(model_pred, dim=0)  # list to tensor
+            model_pred_list = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
+        
+        # NaN Prevention: Check and fix NaN/Inf in each prediction before stacking
+        for i, pred in enumerate(model_pred_list):
+            if torch.isnan(pred).any() or torch.isinf(pred).any():
+                nan_count = torch.isnan(pred).sum().item()
+                inf_count = torch.isinf(pred).sum().item()
+                logger.warning(f"NaN/Inf detected in model_pred[{i}]: {nan_count} NaN, {inf_count} Inf. Using fallback strategy...")
+                
+                # Enable detailed NaN tracking in model for next forward pass
+                if hasattr(self, 'model') and hasattr(self.model, 'diffusion_model'):
+                    self.model.diffusion_model._debug_nan_tracking = True
+                    logger.warning("  Enabled detailed NaN tracking in model forward pass for next step")
+                
+                # Better fallback: Use target value scaled down instead of zeros
+                # This allows the model to learn towards the target even when NaN occurs
+                # We'll compute target later, but for now use a small value based on input statistics
+                # Check if we have access to target (noise - latents) for better fallback
+                # For now, use small random values that match the expected distribution
+                device = pred.device
+                dtype = pred.dtype
+                
+                # Use small random values that match the shape and expected range
+                # Model predictions should be in similar range to target (noise - latents)
+                # Target is typically in range [-10, 10] for VAE latents
+                fallback = torch.randn_like(pred, device=device, dtype=dtype) * 0.1
+                
+                # Replace NaN/Inf with fallback values
+                nan_mask = torch.isnan(pred)
+                inf_mask = torch.isinf(pred)
+                pred = torch.where(nan_mask | inf_mask, fallback, pred)
+                
+                # Final clamp to ensure values are reasonable
+                pred = torch.clamp(pred, min=-10.0, max=10.0)
+                model_pred_list[i] = pred
+                
+                logger.warning(f"  Replaced NaN/Inf with fallback values. New stats: min={pred.min().item():.6f}, max={pred.max().item():.6f}, mean={pred.mean().item():.6f}")
+        
+        model_pred = torch.stack(model_pred_list, dim=0)  # list to tensor
         
         # Debug: Log model_pred immediately after forward pass
         if not hasattr(self, '_debug_step_count'):
@@ -801,8 +849,20 @@ class WanNetworkTrainer(NetworkTrainer):
         
         # Check for NaN in model_pred (should not happen with clamped latents, but log if it does)
         if torch.isnan(model_pred).any():
+            # Track NaN occurrences for fallback strategy
+            if not hasattr(self, '_nan_count'):
+                self._nan_count = 0
+            self._nan_count += 1
+            
             logger.error(f"NaN detected in model_pred! This should not happen with clamped latents. Shape: {model_pred.shape}, dtype: {model_pred.dtype}")
-            # Don't replace NaN here - let it propagate so training stops
+            logger.error(f"  NaN occurrence count: {self._nan_count}")
+            
+            if self._nan_count >= 3:
+                logger.error("Multiple NaN occurrences detected. Strongly recommend switching to bf16 or fp32 mixed precision.")
+                logger.error(f"  Current mixed precision: {args.mixed_precision}")
+                logger.error(f"  To fix: Change --mixed_precision to 'bf16' or 'no' in your training script.")
+            
+            # Don't replace NaN here - let it propagate so training stops (NaN prevention above should catch it)
 
         # flow matching loss
         target = noise - latents

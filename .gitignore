@@ -23,3 +23,5 @@ myface/
 # Debug files
 debug_*.txt
 .lastlibcheck
+debug_batch.txt
+debug_cache_load.txt

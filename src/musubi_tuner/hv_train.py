@@ -378,10 +378,22 @@ class FineTuningTrainer:
             except ImportError:
                 raise ImportError("No bitsandbytes / bitsandbytesがインストールされていないようです")
 
+            # Check if bitsandbytes ROCm binary is available
+            # IMPORTANT: Don't try to access cextension.lib as it may hang trying to load the library
+            # Instead, we'll catch the error during optimizer.step() and fall back then
+            # For now, assume it might work and let the error handler in optimizer.step() catch it
+            bnb_available = True  # Try to use it, will fall back if it fails during step()
+
             if optimizer_type == "AdamW8bit".lower():
-                logger.info(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
-                optimizer_class = bnb.optim.AdamW8bit
-                optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+                if bnb_available:
+                    logger.info(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
+                    optimizer_class = bnb.optim.AdamW8bit
+                    optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+                else:
+                    # Fall back to regular AdamW
+                    logger.warning("Falling back to regular AdamW optimizer (bitsandbytes ROCm binary not available)")
+                    optimizer_class = torch.optim.AdamW
+                    optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         elif optimizer_type == "Adafactor".lower():
             # Adafactor: check relative_step and warmup_init

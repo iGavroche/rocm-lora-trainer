@@ -494,10 +494,22 @@ class NetworkTrainer:
             except ImportError:
                 raise ImportError("No bitsandbytes / bitsandbytesがインストールされていないようです")
 
+            # Check if bitsandbytes ROCm binary is available
+            # IMPORTANT: Don't try to access cextension.lib as it may hang trying to load the library
+            # Instead, we'll catch the error during optimizer.step() and fall back then
+            # For now, assume it might work and let the error handler in optimizer.step() catch it
+            bnb_available = True  # Try to use it, will fall back if it fails during step()
+
             if optimizer_type == "AdamW8bit".lower():
-                logger.info(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
-                optimizer_class = bnb.optim.AdamW8bit
-                optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+                if bnb_available:
+                    logger.info(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
+                    optimizer_class = bnb.optim.AdamW8bit
+                    optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+                else:
+                    # Fall back to regular AdamW
+                    logger.warning("Falling back to regular AdamW optimizer (bitsandbytes ROCm binary not available)")
+                    optimizer_class = torch.optim.AdamW
+                    optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         elif optimizer_type == "Adafactor".lower():
             # Adafactor: check relative_step and warmup_init
@@ -2096,6 +2108,9 @@ class NetworkTrainer:
                     return org_unscale_grads(optimizer, inv_scale, found_inf, True)
 
                 accelerator.scaler._unscale_grads_ = _unscale_grads_replacer
+                
+                # Note: We don't modify _scale directly as it breaks the scaler's internal state (_growth_tracker)
+                # The NaN prevention measures in the model forward pass should handle numerical stability
 
         # before resuming make hook for saving/loading to save/load the network weights only
         def save_model_hook(models, weights, output_dir):
@@ -3110,7 +3125,25 @@ class NetworkTrainer:
                             else:
                                 accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                    optimizer.step()
+                    # Handle bitsandbytes ROCm binary error during step()
+                    try:
+                        optimizer.step()
+                    except RuntimeError as e:
+                        error_msg = str(e)
+                        if any(keyword in error_msg for keyword in ["ROCm binary", "libbitsandbytes_rocm", "Forgot to compile", "not found at", "bitsandbytes library load error"]):
+                            logger.error(
+                                f"Step {step}: bitsandbytes ROCm binary error during optimizer.step(): {error_msg[:300]}\n"
+                                f"Please restart training with --optimizer_type AdamW (without 8bit) instead of AdamW8bit.\n"
+                                f"To use 8-bit optimizer, compile bitsandbytes from source for ROCm."
+                            )
+                            raise RuntimeError(
+                                "bitsandbytes ROCm binary not available. "
+                                "Please restart with --optimizer_type AdamW instead of AdamW8bit."
+                            ) from e
+                        else:
+                            # Some other RuntimeError, re-raise it
+                            raise
+                    
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 

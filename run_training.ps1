@@ -134,7 +134,7 @@ accelerate launch --num_cpu_threads_per_process 1 src/musubi_tuner/wan_train_net
   --preserve_distribution_shape `
   --mixed_precision fp16 `
   --sdpa `
-  --optimizer_type adamw8bit `
+  --optimizer_type AdamW `
   --learning_rate 1e-4 `
   --gradient_checkpointing `
   --max_train_epochs 2 `

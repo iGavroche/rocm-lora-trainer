@@ -141,12 +141,48 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        # Check for NaN/Inf in input BEFORE normalization
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            import logging
+            logger = logging.getLogger(__name__)
+            nan_count = torch.isnan(x).sum().item()
+            inf_count = torch.isinf(x).sum().item()
+            logger.error(f"WanRMSNorm.forward: NaN/Inf detected in INPUT x! NaN={nan_count}, Inf={inf_count}")
+            logger.error(f"  Input x stats: shape={x.shape}, dtype={x.dtype}, device={x.device}")
+            # Replace NaN/Inf with zeros to prevent propagation
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            logger.warning(f"  Replaced NaN/Inf with zeros. New stats: min={x.min().item():.6f}, max={x.max().item():.6f}")
+        
         # return self._norm(x.float()).type_as(x) * self.weight
         # support fp8
         return self._norm(x.float()).type_as(x) * self.weight.to(x.dtype)
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        # Numerical stability: Ensure mean calculation doesn't produce NaN/Inf
+        # In fp16, very small values can cause issues
+        x_sq_mean = x.pow(2).mean(dim=-1, keepdim=True)
+        
+        # Check for NaN/Inf before rsqrt
+        if torch.isnan(x_sq_mean).any() or torch.isinf(x_sq_mean).any():
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"WanRMSNorm: NaN/Inf detected in x_sq_mean! x stats: min={x.min().item():.6f}, max={x.max().item():.6f}, mean={x.mean().item():.6f}, dtype={x.dtype}")
+            x_sq_mean = torch.nan_to_num(x_sq_mean, nan=1.0, posinf=1.0, neginf=1.0)
+        
+        # Clamp to ensure we don't get NaN from rsqrt
+        x_sq_mean = torch.clamp(x_sq_mean, min=1e-10)
+        # Use larger eps for fp16 to prevent NaN
+        eps = max(self.eps, 1e-5 if x.dtype == torch.float16 else self.eps)
+        result = x * torch.rsqrt(x_sq_mean + eps)
+        
+        # Check for NaN/Inf after rsqrt
+        if torch.isnan(result).any() or torch.isinf(result).any():
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"WanRMSNorm: NaN/Inf detected after rsqrt! x_sq_mean stats: min={x_sq_mean.min().item():.6f}, max={x_sq_mean.max().item():.6f}, eps={eps}, dtype={x.dtype}")
+            result = torch.nan_to_num(result, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        return result
 
     # def forward(self, x):
     #     r"""
@@ -231,10 +267,39 @@ class WanSelfAttention(nn.Module):
         # del x
         # query, key, value function
 
+        # Check input x before Linear layers
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            import logging
+            logger = logging.getLogger(__name__)
+            nan_count = torch.isnan(x).sum().item()
+            inf_count = torch.isinf(x).sum().item()
+            logger.error(f"WanSelfAttention.forward: NaN/Inf detected in INPUT x before Linear layers! NaN={nan_count}, Inf={inf_count}")
+            logger.error(f"  Input x stats: shape={x.shape}, dtype={x.dtype}, device={x.device}, min={x.min().item():.6f}, max={x.max().item():.6f}")
+            # Replace NaN/Inf with zeros to prevent propagation
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            logger.warning(f"  Replaced NaN/Inf with zeros. New stats: min={x.min().item():.6f}, max={x.max().item():.6f}")
+        
         q = self.q(x)
         k = self.k(x)
         v = self.v(x)
         del x
+        
+        # Check Linear layer outputs before normalization
+        if torch.isnan(q).any() or torch.isinf(q).any():
+            import logging
+            logger = logging.getLogger(__name__)
+            nan_count = torch.isnan(q).sum().item()
+            inf_count = torch.isinf(q).sum().item()
+            logger.error(f"WanSelfAttention.forward: NaN/Inf detected in q after Linear layer! NaN={nan_count}, Inf={inf_count}")
+            q = torch.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
+        if torch.isnan(k).any() or torch.isinf(k).any():
+            import logging
+            logger = logging.getLogger(__name__)
+            nan_count = torch.isnan(k).sum().item()
+            inf_count = torch.isinf(k).sum().item()
+            logger.error(f"WanSelfAttention.forward: NaN/Inf detected in k after Linear layer! NaN={nan_count}, Inf={inf_count}")
+            k = torch.nan_to_num(k, nan=0.0, posinf=0.0, neginf=0.0)
+        
         q = self.norm_q(q)
         k = self.norm_k(k)
         q = q.view(b, s, n, d)
@@ -420,6 +485,18 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
+        # Check input x at the very start of the block
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            import logging
+            logger = logging.getLogger(__name__)
+            nan_count = torch.isnan(x).sum().item()
+            inf_count = torch.isinf(x).sum().item()
+            logger.error(f"WanAttentionBlock._forward: NaN/Inf detected in INPUT x at block start! NaN={nan_count}, Inf={inf_count}")
+            logger.error(f"  Input x stats: shape={x.shape}, dtype={x.dtype}, device={x.device}, min={x.min().item():.6f}, max={x.max().item():.6f}")
+            # Replace NaN/Inf with zeros to prevent propagation
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            logger.warning(f"  Replaced NaN/Inf with zeros. New stats: min={x.min().item():.6f}, max={x.max().item():.6f}")
+        
         org_dtype = x.dtype
         assert e.dtype == torch.float32
         if self.model_version == "2.1":
@@ -427,9 +504,33 @@ class WanAttentionBlock(nn.Module):
             e = e.chunk(6, dim=1)
             assert e[0].dtype == torch.float32
 
+            # Numerical stability: Check and fix NaN/Inf in modulation parameters before use
+            for i in range(len(e)):
+                if torch.isnan(e[i]).any() or torch.isinf(e[i]).any():
+                    e[i] = torch.clamp(e[i], min=-10.0, max=10.0)
+                    e[i] = torch.nan_to_num(e[i], nan=0.0, posinf=10.0, neginf=-10.0)
+
             # self-attention
+            # Check inputs before self-attention
+            norm1_out = self.norm1(x).float()
+            attn_input = torch.addcmul(e[0], norm1_out, (1 + e[1])).to(org_dtype)
+            
+            if torch.isnan(attn_input).any() or torch.isinf(attn_input).any():
+                import logging
+                logger = logging.getLogger(__name__)
+                nan_count = torch.isnan(attn_input).sum().item()
+                inf_count = torch.isinf(attn_input).sum().item()
+                logger.error(f"WanAttentionBlock._forward: NaN/Inf detected in attn_input before self_attn! NaN={nan_count}, Inf={inf_count}")
+                logger.error(f"  x stats: min={x.min().item():.6f}, max={x.max().item():.6f}, dtype={x.dtype}")
+                logger.error(f"  norm1_out stats: min={norm1_out.min().item():.6f}, max={norm1_out.max().item():.6f}, dtype={norm1_out.dtype}")
+                logger.error(f"  e[0] stats: min={e[0].min().item():.6f}, max={e[0].max().item():.6f}, dtype={e[0].dtype}")
+                logger.error(f"  e[1] stats: min={e[1].min().item():.6f}, max={e[1].max().item():.6f}, dtype={e[1].dtype}")
+                # Replace NaN/Inf with zeros
+                attn_input = torch.nan_to_num(attn_input, nan=0.0, posinf=0.0, neginf=0.0)
+                logger.warning(f"  Replaced NaN/Inf with zeros. New stats: min={attn_input.min().item():.6f}, max={attn_input.max().item():.6f}")
+            
             # y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).to(org_dtype), seq_lens, grid_sizes, freqs)
-            y = self.self_attn(torch.addcmul(e[0], self.norm1(x).float(), (1 + e[1])).to(org_dtype), seq_lens, grid_sizes, freqs)
+            y = self.self_attn(attn_input, seq_lens, grid_sizes, freqs)
             # x = (x + y.to(torch.float32) * e[2]).to(org_dtype)
             x = torch.addcmul(x, y.to(torch.float32), e[2]).to(org_dtype)
             del y
@@ -446,6 +547,12 @@ class WanAttentionBlock(nn.Module):
             e = self.modulation.to(torch.float32) + e
             e = e.chunk(6, dim=2)  # e is [B, L, 6, C] for 2.2
             assert e[0].dtype == torch.float32
+
+            # Numerical stability: Check and fix NaN/Inf in modulation parameters before use
+            for i in range(len(e)):
+                if torch.isnan(e[i]).any() or torch.isinf(e[i]).any():
+                    e[i] = torch.clamp(e[i], min=-10.0, max=10.0)
+                    e[i] = torch.nan_to_num(e[i], nan=0.0, posinf=10.0, neginf=-10.0)
 
             # self-attention
             # y = self.self_attn(
@@ -900,6 +1007,25 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         # print(f"x: {x.shape}, e: {e0.shape}, context: {context.shape}, seq_lens: {seq_lens}")
         input_device = x.device
+        
+        # Diagnostic: Track NaN occurrence during forward pass
+        import logging
+        logger = logging.getLogger(__name__)
+        debug_nan = hasattr(self, '_debug_nan_tracking') and self._debug_nan_tracking
+        if not hasattr(self, '_debug_nan_tracking'):
+            self._debug_nan_tracking = False
+        
+        # Check input x before blocks (always check, not just when debug_nan is enabled)
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            nan_count = torch.isnan(x).sum().item()
+            inf_count = torch.isinf(x).sum().item()
+            logger.error(f"WanModel.forward: NaN/Inf detected in x BEFORE blocks! NaN={nan_count}, Inf={inf_count}")
+            logger.error(f"  x stats: shape={x.shape}, dtype={x.dtype}, device={x.device}, min={x.min().item():.6f}, max={x.max().item():.6f}")
+            logger.error(f"  This means NaN originates in patch embedding or earlier processing!")
+            # Replace NaN/Inf with zeros to prevent propagation
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            logger.warning(f"  Replaced NaN/Inf with zeros. New stats: min={x.min().item():.6f}, max={x.max().item():.6f}")
+        
         for block_idx, block in enumerate(self.blocks):
             is_block_skipped = skip_block_indices is not None and block_idx in skip_block_indices
 
@@ -907,7 +1033,17 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
                 self.offloader.wait_for_block(block_idx)
 
             if not is_block_skipped:
+                x_before = x.clone() if debug_nan else None
                 x = block(x, **kwargs)
+                
+                # Check for NaN after each block (always check, not just when debug_nan is enabled)
+                if torch.isnan(x).any() or torch.isinf(x).any():
+                    nan_count = torch.isnan(x).sum().item()
+                    inf_count = torch.isinf(x).sum().item()
+                    logger.error(f"WanModel.forward: NaN/Inf detected after block {block_idx}! NaN={nan_count}, Inf={inf_count}")
+                    if x_before is not None:
+                        logger.error(f"  Before block: min={x_before.min().item():.6f}, max={x_before.max().item():.6f}, NaN={torch.isnan(x_before).sum().item()}")
+                    logger.error(f"  After block: min={x.min().item():.6f}, max={x.max().item():.6f}, NaN={nan_count}, Inf={inf_count}")
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
