@@ -3077,6 +3077,15 @@ class NetworkTrainer:
                         logger.info(f"Step {step}: Raw loss={raw_loss_value:.6f}, model_pred stats: min={model_pred.min().item():.4f}, max={model_pred.max().item():.4f}, mean={model_pred.mean().item():.4f}")
                         logger.info(f"Step {step}: Target stats: min={target.min().item():.4f}, max={target.max().item():.4f}, mean={target.mean().item():.4f}")
                     
+                    # CRITICAL: Check for NaN/Inf in loss before backward pass
+                    # If loss is NaN, skip this step to prevent crash
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        logger.error(f"Step {step}: CRITICAL - Loss is NaN/Inf ({raw_loss_value}). Skipping optimizer step to prevent crash.")
+                        logger.error(f"  This is likely due to fp16 numerical instability on ROCm. Consider using bf16 or disabling mixed precision.")
+                        # Zero gradients and skip optimizer step
+                        optimizer.zero_grad(set_to_none=True)
+                        continue  # Skip to next iteration
+                    
                     # Warn if loss is suspiciously low or zero
                     if raw_loss_value == 0.0:
                         logger.warning(f"Step {step}: WARNING - Loss is exactly 0.0! This is suspicious. model_pred and target may be identical.")
