@@ -159,8 +159,29 @@ def load_flow_model(
             break  # the model doesn't have annoying prefix
         sd[new_key] = sd.pop(key)
 
-    # if fp8_scaled is True, convert the model to fp8
-    if fp8_scaled:
+    # Check if model is already FP8-scaled (has .scale_weight keys or scaled_fp8 keys or scale_input keys)
+    is_pre_fp8_scaled = any(".scale_weight" in key or "scaled_fp8" in key or "scale_input" in key for key in sd.keys())
+    
+    if is_pre_fp8_scaled:
+        logger.warning("Detected pre-FP8-scaled model. Filtering out incompatible keys and applying FP8 monkey patch.")
+        # Pre-FP8-scaled models have keys like "scale_input" that the model architecture doesn't expect
+        # Filter out these keys as they're not needed for musubi-tuner's FP8 implementation
+        keys_to_remove = [key for key in sd.keys() if "scale_input" in key or key == "scaled_fp8"]
+        for key in keys_to_remove:
+            del sd[key]
+        logger.info(f"Removed {len(keys_to_remove)} incompatible keys from pre-FP8-scaled model.")
+        
+        # Apply FP8 monkey patch to use FP8 operations (the model already has FP8 weights)
+        from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+        apply_fp8_monkey_patch(model, sd, use_scaled_mm=False)
+        
+        if loading_device.type != "cpu":
+            # make sure all the model weights are on the loading_device
+            logger.info(f"Moving weights to {loading_device}")
+            for key in sd.keys():
+                sd[key] = sd[key].to(loading_device)
+    elif fp8_scaled:
+        # if fp8_scaled is True, convert the model to fp8
         # fp8 optimization: calculate on CUDA, move back to CPU if loading_device is CPU (block swap)
         logger.info("Optimizing model weights to fp8. This may take a while.")
         sd = model.fp8_optimization(sd, device, move_to_device=loading_device.type == "cpu")

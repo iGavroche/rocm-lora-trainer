@@ -1,0 +1,19 @@
+[[datasets]]
+image_directory = "myface"
+caption_extension = ".txt"
+num_repeats = 1
+batch_size = 1
+resolution = [ 512, 512,]
+enable_bucket = true
+bucket_no_upscale = true
+
+
+
+
+
+
+
+
+
+
+
