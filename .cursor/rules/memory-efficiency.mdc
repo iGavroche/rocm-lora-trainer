@@ -1,0 +1,67 @@
+---
+description: Memory-efficient loading patterns for large models
+alwaysApply: false
+globs:
+  - "**/safetensors_utils.py"
+  - "**/lora_utils.py"
+  - "**/model.py"
+---
+
+# Memory-Efficient Loading Patterns
+
+This project handles large models (14B+ parameters). Always use memory-efficient loading patterns.
+
+## Safetensors Loading
+
+**Always use `MemoryEfficientSafeOpen`** for large safetensors files:
+
+```python
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors
+
+# ✅ GOOD: Memory-efficient loading
+state_dict = {}
+with MemoryEfficientSafeOpen(path, disable_numpy_memmap=False) as f:
+    keys = list(f.keys())
+    for key in keys:
+        value = f.get_tensor(key, device="cpu")  # Load to CPU first
+        state_dict[key] = value.to(calc_device, non_blocking=True)
+        del value  # Free CPU memory immediately
+```
+
+**Never use `safetensors.torch.load_file()` directly** - it loads entire model into memory.
+
+## Tensor-by-Tensor Transfer
+
+When loading large models, transfer tensors one-by-one and free CPU memory immediately:
+
+```python
+# ✅ GOOD: Load and transfer one by one
+for key in keys:
+    value = f.get_tensor(key)  # CPU
+    state_dict[key] = value.to(calc_device, non_blocking=True)  # GPU
+    del value  # Free CPU memory immediately
+    
+    # Periodic cleanup
+    if (i + 1) % 200 == 0:
+        clean_memory_on_device(calc_device)
+        gc.collect()
+```
+
+## Progress Indicators
+
+Always show progress for large file operations:
+```python
+from tqdm import tqdm
+import sys
+
+file_size_mb = os.path.getsize(path) / (1024 * 1024)
+show_progress = file_size_mb > 50
+
+iterator = tqdm(keys, desc=f"Loading {os.path.basename(path)}", 
+                leave=True, mininterval=0.5, file=sys.stdout) if show_progress else keys
+```
+
+## References
+
+- `src/musubi_tuner/utils/safetensors_utils.py` - Memory-efficient safetensors utilities
+- `src/musubi_tuner/utils/lora_utils.py` - LoRA loading with memory efficiency

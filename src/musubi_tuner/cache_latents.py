@@ -263,22 +263,31 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
 
 
 def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argparse.Namespace):
+    # ThreadPoolExecutor requires max_workers > 0, so ensure at least 1
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
+    num_workers = max(1, num_workers)  # Ensure at least 1 worker
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_latent_cache_paths = []
-        for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
-            all_latent_cache_paths.extend([item.latent_cache_path for item in batch])
+        logger.info(f"Starting to retrieve batches with {num_workers} workers...")
+        try:
+            for batch_key, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
+                logger.info(f"Retrieved batch with key {batch_key}, {len(batch)} items")
+                all_latent_cache_paths.extend([item.latent_cache_path for item in batch])
 
-            if args.skip_existing:
-                filtered_batch = [item for item in batch if not os.path.exists(item.latent_cache_path)]
-                if len(filtered_batch) == 0:
-                    continue
-                batch = filtered_batch
+                if args.skip_existing:
+                    filtered_batch = [item for item in batch if not os.path.exists(item.latent_cache_path)]
+                    if len(filtered_batch) == 0:
+                        continue
+                    batch = filtered_batch
 
-            bs = args.batch_size if args.batch_size is not None else len(batch)
-            for i in range(0, len(batch), bs):
-                encode(batch[i : i + bs])
+                bs = args.batch_size if args.batch_size is not None else len(batch)
+                for i in range(0, len(batch), bs):
+                    logger.info(f"Encoding sub-batch {i//bs + 1} of {(len(batch) + bs - 1)//bs}")
+                    encode(batch[i : i + bs])
+        except Exception as e:
+            logger.error(f"Error during dataset encoding: {e}", exc_info=True)
+            raise
 
         # normalize paths
         all_latent_cache_paths = [os.path.normpath(p) for p in all_latent_cache_paths]

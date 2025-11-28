@@ -84,7 +84,9 @@ def process_text_encoder_batches(
     Architecture independent processing of text encoder batches.
     """
 
+    # ThreadPoolExecutor requires max_workers > 0, so ensure at least 1
     num_workers = num_workers if num_workers is not None else max(1, os.cpu_count() - 1)
+    num_workers = max(1, num_workers)  # Ensure at least 1 worker
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_cache_files = all_cache_files_for_dataset[i]

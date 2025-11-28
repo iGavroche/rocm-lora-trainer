@@ -347,20 +347,69 @@ def get_qwen_prompt_embeds(
     template = prompt_template_encode
     drop_idx = prompt_template_encode_start_idx
     txt = [template.format(e) for e in prompt]
+    
+    # Tokenize - keep original behavior for compatibility
     txt_tokens = tokenizer(txt, max_length=tokenizer_max_length + drop_idx, padding=True, truncation=True, return_tensors="pt").to(
         device
     )
+    
+    # ROCm workaround: synchronize after tokenization
+    is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+    if is_rocm and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
 
-    if is_fp8(dtype):
-        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            encoder_hidden_states = vlm(
-                input_ids=txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask, output_hidden_states=True
-            )
-    else:
-        with torch.no_grad():
-            encoder_hidden_states = vlm(
-                input_ids=txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask, output_hidden_states=True
-            )
+    # ROCm workaround: synchronize before text encoder forward pass
+    if is_rocm and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        # Ensure model is in eval mode
+        vlm.eval()
+    
+    try:
+        # ROCm: Always use explicit autocast with bfloat16 to prevent SIGSEGV
+        if is_rocm and device.type == "cuda":
+            with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                torch.cuda.synchronize(device)
+                # Ensure model is in eval mode
+                vlm.eval()
+                # Process one prompt at a time if batch size > 1
+                if len(prompt) > 1:
+                    # Process sequentially to avoid queue buildup
+                    hidden_states_list = []
+                    for i in range(len(prompt)):
+                        torch.cuda.synchronize(device)
+                        single_tokens = type(txt_tokens)({k: v[i:i+1] for k, v in txt_tokens.items()})
+                        single_hidden = vlm(
+                            input_ids=single_tokens.input_ids, 
+                            attention_mask=single_tokens.attention_mask, 
+                            output_hidden_states=True
+                        )
+                        torch.cuda.synchronize(device)
+                        hidden_states_list.append(single_hidden.hidden_states[-1])
+                    # Concatenate results
+                    hidden_states = torch.cat(hidden_states_list, dim=0)
+                    encoder_hidden_states = type(single_hidden)(hidden_states=[None] * (len(single_hidden.hidden_states) - 1) + [hidden_states])
+                else:
+                    encoder_hidden_states = vlm(
+                        input_ids=txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask, output_hidden_states=True
+                    )
+                torch.cuda.synchronize(device)
+        elif is_fp8(dtype):
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                encoder_hidden_states = vlm(
+                    input_ids=txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask, output_hidden_states=True
+                )
+        else:
+            with torch.no_grad():
+                encoder_hidden_states = vlm(
+                    input_ids=txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask, output_hidden_states=True
+                )
+    except Exception as e:
+        if is_rocm and device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+        raise
     hidden_states = encoder_hidden_states.hidden_states[-1]
     if hidden_states.shape[1] > tokenizer_max_length + drop_idx:
         logger.warning(f"Hidden states shape {hidden_states.shape} exceeds max length {tokenizer_max_length + drop_idx}")

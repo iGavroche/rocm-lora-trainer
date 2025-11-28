@@ -3,6 +3,7 @@ import hashlib
 from io import BytesIO
 from typing import Any, Callable, Optional
 import logging
+import os
 import safetensors.torch
 import torch
 
@@ -232,6 +233,26 @@ def compile_transformer(
     target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]],
     disable_linear: bool,
 ) -> torch.nn.Module:
+    # Check for known torch.compile issue on gfx1151 (Strix Halo)
+    # See: https://github.com/ROCm/TheRock/issues/1937
+    # torch.compile causes system freeze on gfx1151, especially during garbage collection on script exit
+    if torch.cuda.is_available():
+        try:
+            device_name = torch.cuda.get_device_name(0)
+            # Check if we're on gfx1151 (Strix Halo / Radeon 8060S)
+            # This is a heuristic - gfx1151 devices often report as "AMD Radeon Graphics" or similar
+            if hasattr(torch.version, "hip") and torch.version.hip is not None:
+                # We're on ROCm, check for gfx1151 architecture
+                rocm_arch = os.environ.get("PYTORCH_ROCM_ARCH", "")
+                if "gfx1151" in rocm_arch.lower():
+                    logger.warning(
+                        "⚠️  WARNING: torch.compile is known to cause system freezes on gfx1151 (Strix Halo). "
+                        "See https://github.com/ROCm/TheRock/issues/1937 for details. "
+                        "Proceeding with torch.compile may cause system freeze on script exit."
+                    )
+        except Exception:
+            pass  # Ignore errors in device detection
+    
     if disable_linear:
         logger.info("Disable linear from torch.compile for swap blocks...")
         for blocks in target_blocks:

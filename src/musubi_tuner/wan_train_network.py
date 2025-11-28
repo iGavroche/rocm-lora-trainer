@@ -654,25 +654,50 @@ class WanNetworkTrainer(NetworkTrainer):
         model: WanModel = transformer
 
         # I2V training and Control training
+        logger.info("Preparing I2V/Control training data...")
+        import sys
+        sys.stdout.flush()
+        
         image_latents = None
         clip_fea = None
         if self.i2v_training:
+            logger.info("Loading image latents for I2V training...")
+            sys.stdout.flush()
             image_latents = batch["latents_image"]
-            image_latents = image_latents.to(device=accelerator.device, dtype=network_dtype)
+            # ROCm workaround: ensure tensor is on CPU first, then transfer to GPU
+            # This prevents GPU queue evictions that cause SIGSEGV on Strix Halo
+            synchronize_device(accelerator.device)  # Ensure GPU is ready
+            image_latents_cpu = image_latents.cpu() if image_latents.is_cuda else image_latents
+            image_latents = image_latents_cpu.to(device=accelerator.device, dtype=network_dtype)
+            synchronize_device(accelerator.device)  # Ensure transfer completed
+            logger.info(f"Image latents transferred: {image_latents.shape}")
+            sys.stdout.flush()
 
             if not self.config.v2_2:
+                logger.info("Loading CLIP features for I2V training...")
+                sys.stdout.flush()
                 clip_fea = batch["clip"]
-                clip_fea = clip_fea.to(device=accelerator.device, dtype=network_dtype)
+                # ROCm workaround: ensure tensor is on CPU first, then transfer to GPU
+                synchronize_device(accelerator.device)
+                clip_fea_cpu = clip_fea.cpu() if clip_fea.is_cuda else clip_fea
+                clip_fea = clip_fea_cpu.to(device=accelerator.device, dtype=network_dtype)
+                synchronize_device(accelerator.device)
 
                 # clip_fea is [B, N, D] (normal) or [B, 1, N, D] (one frame) for I2V, and [B, 2, N, D] for FLF2V, we need to reshape it to [B, N, D] for I2V and [B*2, N, D] for FLF2V
                 if clip_fea.shape[1] == 1:
                     clip_fea = clip_fea.squeeze(1)
                 elif clip_fea.shape[1] == 2:
                     clip_fea = clip_fea.view(-1, clip_fea.shape[2], clip_fea.shape[3])
+                logger.info(f"CLIP features prepared: {clip_fea.shape}")
+                sys.stdout.flush()
 
         if self.control_training:
+            logger.info("Loading control latents...")
+            sys.stdout.flush()
             control_latents = batch["latents_control"]
+            synchronize_device(accelerator.device)
             control_latents = control_latents.to(device=accelerator.device, dtype=network_dtype)
+            synchronize_device(accelerator.device)
             if image_latents is not None:
                 image_latents = image_latents[:, 4:]  # remove mask for Wan2.1-Fun-Control
                 image_latents[:, :, 1:] = 0  # remove except the first frame
@@ -681,7 +706,20 @@ class WanNetworkTrainer(NetworkTrainer):
             image_latents = torch.concat([control_latents, image_latents], dim=1)  # B, C, F, H, W
             control_latents = None
 
-        context = [t.to(device=accelerator.device, dtype=network_dtype) for t in batch["t5"]]
+        logger.info("Transferring T5 context to device...")
+        sys.stdout.flush()
+        synchronize_device(accelerator.device)
+        context = []
+        for i, t in enumerate(batch["t5"]):
+            # ROCm workaround: ensure tensor is on CPU first, then transfer to GPU
+            # This prevents GPU queue evictions that cause SIGSEGV on Strix Halo
+            t_cpu = t.cpu() if t.is_cuda else t
+            context.append(t_cpu.to(device=accelerator.device, dtype=network_dtype))
+            if i == 0:  # Sync after first transfer
+                synchronize_device(accelerator.device)
+        synchronize_device(accelerator.device)
+        logger.info(f"T5 context transferred: {len(context)} tensors")
+        sys.stdout.flush()
 
         # ensure the hidden state will require grad
         if args.gradient_checkpointing:
@@ -694,13 +732,78 @@ class WanNetworkTrainer(NetworkTrainer):
                 clip_fea.requires_grad_(True)
 
         # call DiT
+        logger.info("Preparing latents and noisy_model_input...")
+        sys.stdout.flush()
         lat_f, lat_h, lat_w = latents.shape[2:5]
         seq_len = lat_f * lat_h * lat_w // (self.config.patch_size[0] * self.config.patch_size[1] * self.config.patch_size[2])
-        latents = latents.to(device=accelerator.device, dtype=network_dtype)
-        noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=network_dtype)
-        with accelerator.autocast():
-            model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
+        synchronize_device(accelerator.device)
+        # ROCm workaround: ensure tensors are on CPU first, then transfer to GPU
+        latents_cpu = latents.cpu() if latents.is_cuda else latents
+        latents = latents_cpu.to(device=accelerator.device, dtype=network_dtype)
+        synchronize_device(accelerator.device)
+        noisy_model_input_cpu = noisy_model_input.cpu() if noisy_model_input.is_cuda else noisy_model_input
+        noisy_model_input = noisy_model_input_cpu.to(device=accelerator.device, dtype=network_dtype)
+        synchronize_device(accelerator.device)
+        logger.info(f"Latents prepared: {latents.shape}, noisy_input: {noisy_model_input.shape}")
+        sys.stdout.flush()
+        
+        logger.info(f"Calling DiT forward pass: input_shape={noisy_model_input.shape}, timesteps={timesteps.shape}, seq_len={seq_len}")
+        import sys
+        sys.stdout.flush()
+        
+        # ROCm workaround: accelerator.autocast() causes SIGSEGV on Strix Halo (gfx1151)
+        # Use torch.amp.autocast() directly instead
+        # Check if we're on ROCm by checking if HIP is available
+        is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+        
+        synchronize_device(accelerator.device)  # Ensure all transfers are complete before forward
+        
+        if is_rocm:
+            # On ROCm, use torch.amp.autocast() directly (more stable, avoids SIGSEGV)
+            logger.info("Using torch.amp.autocast() for mixed precision (ROCm - avoids SIGSEGV)")
+            sys.stdout.flush()
+            dtype = torch.float16 if accelerator.mixed_precision == "fp16" else (torch.bfloat16 if accelerator.mixed_precision == "bf16" else None)
+            
+            # ROCm workaround: Add extra synchronization and error handling for forward pass
+            synchronize_device(accelerator.device)
+            try:
+                if dtype is not None:
+                    with torch.amp.autocast(device_type="cuda", dtype=dtype):
+                        model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
+                else:
+                    # No mixed precision
+                    model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
+            except RuntimeError as e:
+                logger.error(f"RuntimeError during model forward pass: {e}")
+                logger.error("This may indicate a ROCm driver issue. Try reducing batch size or using gradient checkpointing.")
+                raise
+            finally:
+                synchronize_device(accelerator.device)
+        else:
+            # On CUDA, use accelerator.autocast() (preferred)
+            try:
+                if hasattr(accelerator, 'autocast') and accelerator.mixed_precision is not None:
+                    logger.info("Using accelerator.autocast() for mixed precision")
+                    sys.stdout.flush()
+                    with accelerator.autocast():
+                        model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
+                else:
+                    # No mixed precision
+                    model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
+            except (AttributeError, RuntimeError) as e:
+                logger.warning(f"accelerator.autocast() failed, falling back to torch.amp.autocast(): {e}")
+                sys.stdout.flush()
+                dtype = torch.float16 if accelerator.mixed_precision == "fp16" else (torch.bfloat16 if accelerator.mixed_precision == "bf16" else None)
+                if dtype is not None:
+                    with torch.amp.autocast(device_type="cuda", dtype=dtype):
+                        model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
+                else:
+                    model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
+        
+        synchronize_device(accelerator.device)  # Ensure forward pass completed
         model_pred = torch.stack(model_pred, dim=0)  # list to tensor
+        logger.info(f"DiT forward pass completed: output_shape={model_pred.shape}")
+        sys.stdout.flush()
 
         # flow matching loss
         target = noise - latents

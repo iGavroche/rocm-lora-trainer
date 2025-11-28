@@ -1,0 +1,64 @@
+---
+description: Testing patterns and validation approaches
+alwaysApply: false
+globs:
+  - "**/test_*.py"
+  - "test_*.py"
+---
+
+# Testing Patterns
+
+Since this project deals with ML models, testing focuses on validation and smoke tests.
+
+## Basic Operation Tests
+
+Test CPU-first patterns work:
+```python
+def test_cpu_first_random():
+    device = torch.device('cuda:0')
+    rand_cpu = torch.randn(10, device='cpu')
+    result = rand_cpu.to(device=device)
+    torch.cuda.synchronize(device)
+    assert result.device == device
+```
+
+## Safetensors Loading Tests
+
+Test memory-efficient loading:
+```python
+def test_safetensors_loading():
+    state_dict = load_safetensors(path, device="cpu")
+    assert len(state_dict) > 0
+    # Verify tensors are on correct device
+    for key, tensor in state_dict.items():
+        assert tensor.device.type == "cpu"
+```
+
+## Device Compatibility Tests
+
+Test ROCm detection:
+```python
+def test_rocm_detection():
+    is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+    if torch.cuda.is_available():
+        # Test ROCm-specific operations
+        pass
+```
+
+## Minimal Reproductions
+
+Create minimal test scripts to isolate issues:
+- `test_rocm_operations.py` - Test basic ROCm operations
+- `test_safetensors_loading.py` - Test safetensors loading
+- Keep tests small and focused
+
+## Manual Testing Guidelines
+
+1. Test with small datasets first
+2. Verify memory usage is within expected bounds
+3. Test on different GPU configurations if possible
+4. Validate output quality for generation/training
+
+## References
+
+- See existing `test_*.py` files in project root for examples

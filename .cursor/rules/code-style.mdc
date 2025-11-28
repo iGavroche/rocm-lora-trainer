@@ -1,0 +1,91 @@
+---
+description: Code style and conventions for this project
+alwaysApply: true
+---
+
+# Code Style and Conventions
+
+Follow these conventions when contributing to this project.
+
+## Python Style
+
+- **Line length**: 132 characters (see `pyproject.toml`)
+- **Indentation**: 4 spaces
+- **Quotes**: Double quotes
+- **Target Python**: 3.10+
+- **Formatter**: Ruff (not Black)
+
+## Naming Conventions
+
+- **Files**: snake_case (`wan_train_network.py`, `lora_utils.py`)
+- **Classes**: PascalCase (`WanModel`, `NetworkTrainer`)
+- **Functions/Variables**: snake_case (`load_safetensors`, `device_utils`)
+- **Constants**: UPPER_SNAKE_CASE (`MIXED_PRECISION`, `BATCH_SIZE`)
+
+## Architecture-Specific Files
+
+When adding new architectures, follow naming patterns:
+- Training: `{arch}_train_network.py` (e.g., `wan_train_network.py`)
+- Generation: `{arch}_generate_{type}.py` (e.g., `wan_generate_video.py`)
+
+## Imports
+
+Order imports as:
+1. Standard library
+2. Third-party packages
+3. Local imports
+
+Use absolute imports when possible:
+```python
+from musubi_tuner.utils.device_utils import synchronize_device
+```
+
+## Type Hints
+
+Add type hints for public APIs:
+```python
+def load_safetensors(
+    path: str,
+    device: Union[str, torch.device],
+    dtype: Optional[torch.dtype] = None,
+) -> dict[str, torch.Tensor]:
+```
+
+## Logging
+
+Use the standard logging module:
+```python
+import logging
+logger = logging.getLogger(__name__)
+
+logger.info("Loading model...")
+logger.warning("This may take a while")
+logger.error("Failed to load", exc_info=True)
+```
+
+Always flush stdout after logging for better visibility:
+```python
+import sys
+logger.info("Message")
+sys.stdout.flush()
+```
+
+## Error Handling
+
+- Let unrecoverable errors propagate
+- Only catch errors you can handle
+- Use `exc_info=True` in error logs
+- Add ROCm-specific error handling where needed
+
+## Code Quality
+
+Run before committing:
+```bash
+ruff check --fix
+ruff format src
+```
+
+## References
+
+- `pyproject.toml` - Ruff configuration
+- `CONTRIBUTING.md` - Detailed contribution guidelines

@@ -295,26 +295,50 @@ def load_safetensors(
     dtype: Optional[torch.dtype] = None,
     disable_numpy_memmap: bool = False,
 ) -> dict[str, torch.Tensor]:
-    if disable_mmap:
-        # return safetensors.torch.load(open(path, "rb").read())
-        # use experimental loader
-        # logger.info(f"Loading without mmap (experimental)")
-        state_dict = {}
-        device = torch.device(device) if device is not None else None
-        with MemoryEfficientSafeOpen(path, disable_numpy_memmap=disable_numpy_memmap) as f:
-            for key in f.keys():
-                state_dict[key] = f.get_tensor(key, device=device, dtype=dtype)
-        synchronize_device(device)
-        return state_dict
-    else:
-        try:
-            state_dict = load_file(path, device=device)
-        except:
-            state_dict = load_file(path)  # prevent device invalid Error
-        if dtype is not None:
-            for key in state_dict.keys():
-                state_dict[key] = state_dict[key].to(dtype=dtype)
-        return state_dict
+    # For safetensors 0.7.0+, load_file no longer accepts device parameter
+    # Use memory-efficient loader by default to avoid loading entire model into memory at once
+    # This is especially important for large models (14B+ parameters)
+    import os
+    import logging
+    from tqdm import tqdm
+    
+    logger = logging.getLogger(__name__)
+    
+    # Get file size to show progress for large files
+    file_size_mb = os.path.getsize(path) / (1024 * 1024)
+    show_progress = file_size_mb > 50  # Show progress for files > 50MB
+    
+    logger.info(f"Loading safetensors file: {os.path.basename(path)} ({file_size_mb:.1f} MB)")
+    import sys
+    sys.stdout.flush()
+    
+    state_dict = {}
+    target_device = torch.device(device) if device is not None else None
+    
+    logger.info(f"Opening safetensors file: {path}")
+    sys.stdout.flush()
+    
+    with MemoryEfficientSafeOpen(path, disable_numpy_memmap=disable_numpy_memmap) as f:
+        logger.info("Reading tensor keys from safetensors file...")
+        sys.stdout.flush()
+        keys = list(f.keys())
+        logger.info(f"Found {len(keys)} tensors in {os.path.basename(path)}")
+        sys.stdout.flush()
+        
+        iterator = tqdm(keys, desc=f"Loading {os.path.basename(path)}", leave=True, mininterval=0.5, file=sys.stdout) if show_progress else keys
+        for i, key in enumerate(iterator):
+            if i % 100 == 0:
+                if not show_progress:
+                    logger.info(f"Loading tensor {i}/{len(keys)}: {key[:50]}...")
+                sys.stdout.flush()
+            state_dict[key] = f.get_tensor(key, device=target_device, dtype=dtype)
+    
+    logger.info(f"Synchronizing device {target_device}...")
+    sys.stdout.flush()
+    synchronize_device(target_device)
+    logger.info(f"Finished loading {os.path.basename(path)} ({len(state_dict)} tensors)")
+    sys.stdout.flush()
+    return state_dict
 
 
 def load_split_weights(

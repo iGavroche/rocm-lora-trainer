@@ -1,0 +1,91 @@
+---
+description: ROCm and Strix Halo (gfx1151) compatibility patterns and workarounds
+alwaysApply: true
+---
+
+# ROCm Compatibility Rules
+
+This project supports AMD ROCm, particularly on Strix Halo (gfx1151) systems. Follow these patterns to ensure stability.
+
+## CPU-First Tensor Operations
+
+**Critical**: On ROCm/Strix Halo, many GPU operations can cause SIGSEGV due to GPU queue evictions. Always use CPU-first patterns:
+
+### Random Number Generation
+```python
+# ❌ BAD: Direct GPU random generation
+rand_gpu = torch.randn(bs, device=device)
+
+# ✅ GOOD: CPU-first pattern
+rand_cpu = torch.randn(bs, device="cpu")
+result = rand_cpu.to(device=device)
+synchronize_device(device)
+```
+
+### Tensor Transfers
+```python
+# ❌ BAD: Direct transfer
+tensor_gpu = tensor.to(device=device)
+
+# ✅ GOOD: CPU-first transfer
+tensor_cpu = tensor.cpu() if tensor.is_cuda else tensor
+tensor_gpu = tensor_cpu.to(device=device)
+synchronize_device(device)
+```
+
+### Special Functions (erfinv, etc.)
+```python
+# ❌ BAD: GPU erfinv
+result = torch.erfinv(tensor)
+
+# ✅ GOOD: CPU-first erfinv
+tensor_cpu = tensor.cpu() if tensor.is_cuda else tensor
+erfinv_result = torch.erfinv(tensor_cpu)
+result = erfinv_result.to(device=tensor.device) if tensor.is_cuda else erfinv_result
+```
+
+## Autocast Context
+
+**Never use `accelerator.autocast()` on ROCm** - it causes SIGSEGV. Always detect ROCm and use `torch.amp.autocast()`:
+
+```python
+is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+
+if is_rocm:
+    with torch.amp.autocast(device_type="cuda", dtype=dtype):
+        # model operations
+else:
+    with accelerator.autocast():
+        # model operations
+```
+
+## Attention Mechanisms
+
+- **SDPA**: Always use `--split_attn` flag on ROCm to process attention in smaller chunks
+- **Synchronization**: Add `torch.cuda.synchronize()` before and after attention operations
+- **Xformers**: Preferred for ROCm if available, use with `--split_attn`
+
+## RoPE Operations
+
+Add synchronization around RoPE operations:
+```python
+if x.device.type == "cuda":
+    torch.cuda.synchronize(x.device)
+# ... RoPE operations ...
+if x.device.type == "cuda":
+    torch.cuda.synchronize(x.device)
+```
+
+## Environment Variables
+
+Required ROCm environment variables (see `train_chani_full.sh`):
+- `HSA_XNACK=0` - Disable XNACK for RDNA3.5 stability
+- `HSA_ENABLE_SDMA=0` - Disable SDMA to fix allocation faults
+- `PYTORCH_ROCM_ARCH=gfx1151` - Set GPU architecture
+- `HSA_OVERRIDE_GFX_VERSION=11.0.0` - Override GFX version
+
+## References
+
+- See `src/musubi_tuner/utils/device_utils.py` for `synchronize_device()` helper
+- See `src/musubi_tuner/hv_train_network.py` for CPU-first random generation patterns
+- See `src/musubi_tuner/wan/modules/attention.py` for attention synchronization patterns

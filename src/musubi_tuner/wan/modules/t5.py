@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from musubi_tuner.wan.modules.tokenizers import HuggingfaceTokenizer
 from accelerate import init_empty_weights
-from safetensors.torch import load_file
+from musubi_tuner.utils.safetensors_utils import load_safetensors
 
 import logging
 
@@ -478,7 +478,10 @@ class T5EncoderModel:
         else:
             logger.info(f"loading weights from {weight_path}")
             if os.path.splitext(weight_path)[1] == ".safetensors":
-                sd = load_file(weight_path)
+                # Use memory-efficient loader for safetensors 0.7.0+ compatibility
+                logger.info("Starting to load T5 weights from safetensors file...")
+                sd = load_safetensors(weight_path, device="cpu", disable_mmap=False)
+                logger.info(f"Loaded {len(sd)} tensors from T5 safetensors file")
             else:
                 sd = torch.load(weight_path, map_location="cpu", weights_only=True)
             # remove prefix "encoder." from the state dict

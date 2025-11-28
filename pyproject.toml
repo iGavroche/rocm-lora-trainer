@@ -35,12 +35,17 @@ cu128 = [
     "torch>=2.7.1",
     "torchvision>=0.22.1",
 ]
+rocm71 = [
+    "torch>=2.8.0",
+    "torchvision>=0.21.0",
+]
 
 [tool.uv]
 conflicts = [
   [
     { extra = "cu124" },
     { extra = "cu128" },
+    { extra = "rocm71" },
   ],
 ]
 

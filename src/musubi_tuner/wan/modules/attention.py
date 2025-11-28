@@ -98,16 +98,25 @@ def flash_attention(
         v = half(v.transpose(1, 2))
 
         if not split_attn:
+            # ROCm workaround: synchronize before SDPA to avoid queue evictions
+            if q.device.type == "cuda":
+                torch.cuda.synchronize(q.device)
             q = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, is_causal=causal, dropout_p=dropout_p, scale=softmax_scale
             )
             x = q
         else:
+            # ROCm workaround: process each sample separately with synchronization
+            # This reduces GPU queue pressure and helps avoid SIGSEGV on Strix Halo
             x = torch.empty_like(q)
             for i in range(q.size(0)):
+                if q.device.type == "cuda":
+                    torch.cuda.synchronize(q.device)
                 x[i : i + 1] = torch.nn.functional.scaled_dot_product_attention(
                     q[i : i + 1], k[i : i + 1], v[i : i + 1], is_causal=causal, dropout_p=dropout_p, scale=softmax_scale
                 )
+                if q.device.type == "cuda":
+                    torch.cuda.synchronize(q.device)
 
         del q, k, v
         x = x.transpose(1, 2).contiguous()

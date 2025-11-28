@@ -1,0 +1,85 @@
+---
+description: Training loop patterns and best practices
+alwaysApply: false
+globs:
+  - "**/*_train_network.py"
+  - "**/hv_train_network.py"
+---
+
+# Training Loop Patterns
+
+Common patterns for training scripts in this project.
+
+## Device Synchronization
+
+Always synchronize device before and after critical operations:
+```python
+from musubi_tuner.utils.device_utils import synchronize_device
+
+synchronize_device(device)
+# ... operation ...
+synchronize_device(device)
+```
+
+## Mixed Precision
+
+Detect ROCm and use appropriate autocast:
+```python
+is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+
+if is_rocm:
+    dtype = torch.float16 if accelerator.mixed_precision == "fp16" else None
+    with torch.amp.autocast(device_type="cuda", dtype=dtype):
+        model_pred = model(...)
+else:
+    with accelerator.autocast():
+        model_pred = model(...)
+```
+
+## Gradient Accumulation
+
+Use accelerator's accumulate context:
+```python
+with accelerator.accumulate(model):
+    loss = compute_loss(...)
+    accelerator.backward(loss)
+```
+
+## Progress Logging
+
+Log progress with explicit flushing:
+```python
+logger.info(f"Processing batch {step}/{total_batches}")
+sys.stdout.flush()
+```
+
+## Memory Management
+
+Clean memory periodically:
+```python
+from musubi_tuner.utils.device_utils import clean_memory_on_device
+import gc
+
+if step % 100 == 0:
+    clean_memory_on_device(accelerator.device)
+    gc.collect()
+```
+
+## Error Handling in Training Loops
+
+Wrap forward passes in try-except for better error messages:
+```python
+try:
+    model_pred = model(...)
+except RuntimeError as e:
+    logger.error(f"RuntimeError during forward pass: {e}")
+    logger.error("This may indicate a ROCm driver issue.")
+    raise
+finally:
+    synchronize_device(accelerator.device)
+```
+
+## References
+
+- `src/musubi_tuner/hv_train_network.py` - Base training class
+- `src/musubi_tuner/wan_train_network.py` - WAN-specific training

@@ -24,7 +24,14 @@ import toml
 
 import torch
 from tqdm import tqdm
-from accelerate.utils import TorchDynamoPlugin, set_seed, DynamoBackend
+from accelerate.utils import set_seed
+try:
+    from accelerate.utils import TorchDynamoPlugin, DynamoBackend
+    HAS_DYNAMO_PLUGIN = True
+except ImportError:
+    HAS_DYNAMO_PLUGIN = False
+    TorchDynamoPlugin = None
+    DynamoBackend = None
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
 from safetensors.torch import load_file
 import transformers
@@ -158,23 +165,36 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
     ]
     kwargs_handlers = [i for i in kwargs_handlers if i is not None]
 
-    dynamo_plugin = None
-    if args.dynamo_backend.upper() != "NO":
+    # Check if accelerate version supports dynamo_plugin
+    import accelerate
+    from packaging import version
+    
+    accelerator_kwargs = {
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "mixed_precision": args.mixed_precision if args.mixed_precision else None,
+        "log_with": log_with,
+        "project_dir": logging_dir,
+        "kwargs_handlers": kwargs_handlers,
+    }
+    
+    # dynamo_plugin was added in accelerate 0.20.0+
+    if (args.dynamo_backend.upper() != "NO" and 
+        HAS_DYNAMO_PLUGIN and 
+        version.parse(accelerate.__version__) >= version.parse("0.20.0")):
         dynamo_plugin = TorchDynamoPlugin(
             backend=DynamoBackend(args.dynamo_backend.upper()),
             mode=args.dynamo_mode,
             fullgraph=args.dynamo_fullgraph,
             dynamic=args.dynamo_dynamic,
         )
+        accelerator_kwargs["dynamo_plugin"] = dynamo_plugin
+    elif args.dynamo_backend.upper() != "NO":
+        logger.warning(
+            f"dynamo_backend={args.dynamo_backend} is not supported in accelerate {accelerate.__version__}. "
+            "Upgrade to accelerate>=0.20.0 to use dynamo. Ignoring dynamo settings."
+        )
 
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision if args.mixed_precision else None,
-        log_with=log_with,
-        project_dir=logging_dir,
-        dynamo_plugin=dynamo_plugin,
-        kwargs_handlers=kwargs_handlers,
-    )
+    accelerator = Accelerator(**accelerator_kwargs)
     print("accelerator device:", accelerator.device)
     return accelerator
 
@@ -791,7 +811,11 @@ class NetworkTrainer:
         batch_size = noise.shape[0]
 
         if timesteps is not None:
-            timesteps = torch.tensor(timesteps, device=device)
+            # ROCm workaround: create tensor on CPU first, then move to GPU
+            from musubi_tuner.utils.device_utils import synchronize_device
+            timesteps_cpu = torch.tensor(timesteps, device="cpu")
+            timesteps = timesteps_cpu.to(device=device)
+            synchronize_device(device)
 
         # This function converts uniform distribution samples to logistic distribution samples.
         # The final distribution of the samples after shifting significantly differs from the original normal distribution.
@@ -812,7 +836,10 @@ class NetworkTrainer:
 
             # PPF of standard normal distribution: sqrt(2) * erfinv(2q - 1)
             term = 2.0 * t_uniform - 1.0
-            x_normal = math.sqrt(2.0) * torch.erfinv(term)
+            # ROCm workaround: erfinv on CPU then transfer to GPU (prevents SIGSEGV)
+            term_cpu = term.cpu() if term.is_cuda else term
+            erfinv_result = torch.erfinv(term_cpu)
+            x_normal = math.sqrt(2.0) * (erfinv_result.to(device=term.device) if term.is_cuda else erfinv_result)
             return x_normal
 
         def uniform_to_logsnr_ppF_pytorch(t_uniform: torch.Tensor, mean: float, std: float) -> torch.Tensor:
@@ -822,7 +849,11 @@ class NetworkTrainer:
             t_uniform = torch.clamp(t_uniform, eps, 1.0 - eps)
 
             term = 2.0 * t_uniform - 1.0
-            logsnr = mean + std * math.sqrt(2.0) * torch.erfinv(term)
+            # ROCm workaround: erfinv on CPU then transfer to GPU (prevents SIGSEGV)
+            term_cpu = term.cpu() if term.is_cuda else term
+            erfinv_result = torch.erfinv(term_cpu)
+            erfinv_gpu = erfinv_result.to(device=term.device) if term.is_cuda else erfinv_result
+            logsnr = mean + std * math.sqrt(2.0) * erfinv_gpu
             return logsnr
 
         if (
@@ -839,27 +870,53 @@ class NetworkTrainer:
             def compute_sampling_timesteps(org_timesteps: Optional[torch.Tensor]) -> torch.Tensor:
                 def rand(bs: int, org_ts: Optional[torch.Tensor] = None) -> torch.Tensor:
                     nonlocal device
-                    return torch.rand((bs,), device=device) if org_ts is None else org_ts
+                    if org_ts is not None:
+                        # ROCm workaround: keep on CPU if input is CPU, otherwise convert
+                        return org_ts.cpu() if org_ts.is_cuda else org_ts
+                    # ROCm workaround: generate on CPU, keep on CPU
+                    # Caller will handle device transfer if needed
+                    rand_cpu = torch.rand(bs, device="cpu")
+                    return rand_cpu
 
                 def randn(bs: int, org_ts: Optional[torch.Tensor] = None) -> torch.Tensor:
                     nonlocal device
-                    return uniform_to_normal_ppF(org_ts) if org_ts is not None else torch.randn((bs,), device=device)
+                    if org_ts is not None:
+                        # ROCm workaround: ensure input is on CPU for uniform_to_normal_ppF
+                        org_ts_cpu = org_ts.cpu() if org_ts.is_cuda else org_ts
+                        result_cpu = uniform_to_normal_ppF(org_ts_cpu)
+                        # Keep on CPU - caller will handle device transfer if needed
+                        return result_cpu
+                    # ROCm workaround: generate on CPU, keep on CPU
+                    # Caller will handle device transfer if needed
+                    randn_cpu = torch.randn(bs, device="cpu")
+                    return randn_cpu
 
                 def rand_logsnr(bs: int, mean: float, std: float, org_ts: Optional[torch.Tensor] = None) -> torch.Tensor:
                     nonlocal device
-                    logsnr = (
-                        uniform_to_logsnr_ppF_pytorch(org_ts, mean, std)
-                        if org_ts is not None
-                        else torch.normal(mean=mean, std=std, size=(bs,), device=device)
-                    )
-                    return logsnr
+                    if org_ts is not None:
+                        # ROCm workaround: ensure input is on CPU for uniform_to_logsnr_ppF_pytorch
+                        org_ts_cpu = org_ts.cpu() if org_ts.is_cuda else org_ts
+                        result_cpu = uniform_to_logsnr_ppF_pytorch(org_ts_cpu, mean, std)
+                        # Keep on CPU - caller will handle device transfer if needed
+                        return result_cpu
+                    # ROCm workaround: generate on CPU, keep on CPU
+                    # Caller will handle device transfer if needed
+                    normal_cpu = torch.normal(mean=mean, std=std, size=(bs,), device="cpu")
+                    return normal_cpu
 
                 if args.timestep_sampling == "uniform" or args.timestep_sampling == "sigmoid":
                     # Simple random t-based noise sampling
+                    # ROCm workaround: all operations on CPU
                     if args.timestep_sampling == "sigmoid":
-                        t = torch.sigmoid(args.sigmoid_scale * randn(batch_size, org_timesteps))
+                        randn_cpu = randn(batch_size, org_timesteps)
+                        sigmoid_scale = getattr(args, 'sigmoid_scale', 1.0) if hasattr(args, 'sigmoid_scale') else 1.0
+                        t_cpu = torch.sigmoid(sigmoid_scale * randn_cpu)
+                        # Keep on CPU - caller will handle GPU transfer
+                        t = t_cpu
                     else:
-                        t = rand(batch_size, org_timesteps)
+                        rand_cpu = rand(batch_size, org_timesteps)
+                        # Keep on CPU - caller will handle GPU transfer
+                        t = rand_cpu
 
                 elif args.timestep_sampling.endswith("shift"):
                     if args.timestep_sampling == "shift":
@@ -875,67 +932,110 @@ class NetworkTrainer:
                         #     return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma) # sigma=1.0
                         shift = math.exp(mu)
 
-                    logits_norm = randn(batch_size, org_timesteps)
-                    logits_norm = logits_norm * args.sigmoid_scale  # larger scale for more uniform sampling
-                    t = logits_norm.sigmoid()
-                    t = (t * shift) / (1 + (shift - 1) * t)
+                    # ROCm workaround: compute ENTIRE shift sampling on CPU to avoid GPU queue evictions
+                    # GPU queue evictions cause SIGSEGV on Strix Halo (RDNA3.5)
+                    # This is slower but stable
+                    from musubi_tuner.utils.device_utils import synchronize_device
+                    synchronize_device(device)
+                    
+                    # Generate random numbers on CPU directly (bypass GPU randn)
+                    if org_timesteps is not None:
+                        # If org_timesteps provided, convert to CPU
+                        logits_norm_cpu = org_timesteps.cpu() if org_timesteps.is_cuda else org_timesteps
+                    else:
+                        # Generate on CPU directly (avoid GPU random operations)
+                        logits_norm_cpu = torch.randn(batch_size, device="cpu")
+                    
+                    # Ensure sigmoid_scale is a scalar
+                    sigmoid_scale = getattr(args, 'sigmoid_scale', 1.0) if hasattr(args, 'sigmoid_scale') else 1.0
+                    
+                    # All computations on CPU to avoid GPU queue evictions
+                    logits_norm_cpu = logits_norm_cpu * sigmoid_scale
+                    t_cpu = logits_norm_cpu.sigmoid()
+                    denominator_cpu = 1 + (shift - 1) * t_cpu
+                    t_cpu = (t_cpu * shift) / denominator_cpu
+                    
+                    # Keep on CPU - caller will handle GPU transfer
+                    t = t_cpu
 
                 elif args.timestep_sampling == "logsnr":
                     # https://arxiv.org/abs/2411.14793v3
-                    logsnr = rand_logsnr(batch_size, args.logit_mean, args.logit_std, org_timesteps)
-                    t = torch.sigmoid(-logsnr / 2)
+                    # ROCm workaround: all operations on CPU
+                    logsnr_cpu = rand_logsnr(batch_size, args.logit_mean, args.logit_std, org_timesteps)
+                    t_cpu = torch.sigmoid(-logsnr_cpu / 2)
+                    # Keep on CPU - caller will handle GPU transfer
+                    t = t_cpu
 
                 elif args.timestep_sampling.startswith("qinglong"):
                     # Qinglong triple hybrid sampling: mid_shift:logsnr:logsnr2 = .80:.075:.125
                     # First decide which method to use for each sample independently
-                    decision_t = torch.rand((batch_size,), device=device)
+                    # ROCm workaround: all operations on CPU
+                    decision_t_cpu = torch.rand((batch_size,), device="cpu")
 
                     # Create masks based on decision_t: .80 for mid_shift, 0.075 for logsnr, and 0.125 for logsnr2
-                    mid_mask = decision_t < 0.80  # 80% for mid_shift
-                    logsnr_mask = (decision_t >= 0.80) & (decision_t < 0.875)  # 7.5% for logsnr
-                    logsnr_mask2 = decision_t >= 0.875  # 12.5% for logsnr with -logit_mean
+                    mid_mask_cpu = decision_t_cpu < 0.80  # 80% for mid_shift
+                    logsnr_mask_cpu = (decision_t_cpu >= 0.80) & (decision_t_cpu < 0.875)  # 7.5% for logsnr
+                    logsnr_mask2_cpu = decision_t_cpu >= 0.875  # 12.5% for logsnr with -logit_mean
 
-                    # Initialize output tensor
-                    t = torch.zeros((batch_size,), device=device)
+                    # Initialize output tensor on CPU
+                    t_cpu = torch.zeros((batch_size,), device="cpu")
 
                     # Generate mid_shift samples for selected indices (80%)
-                    if mid_mask.any():
-                        mid_count = mid_mask.sum().item()
+                    if mid_mask_cpu.any():
+                        mid_count = mid_mask_cpu.sum().item()
                         h, w = latents.shape[-2:]
                         if args.timestep_sampling == "qinglong_flux":
                             mu = train_utils.get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
                         elif args.timestep_sampling == "qinglong_qwen":
                             mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=8192, y2=0.9)((h // 2) * (w // 2))
                         shift = math.exp(mu)
-                        logits_norm_mid = randn(mid_count, org_timesteps[mid_mask] if org_timesteps is not None else None)
+                        # Extract CPU tensors for mid_mask indices if org_timesteps provided
+                        org_timesteps_mid = None
+                        if org_timesteps is not None:
+                            org_timesteps_cpu = org_timesteps.cpu() if org_timesteps.is_cuda else org_timesteps
+                            org_timesteps_mid = org_timesteps_cpu[mid_mask_cpu] if org_timesteps_cpu.numel() > 0 else None
+                        logits_norm_mid = randn(mid_count, org_timesteps_mid)
                         logits_norm_mid = logits_norm_mid * args.sigmoid_scale
                         t_mid = logits_norm_mid.sigmoid()
                         t_mid = (t_mid * shift) / (1 + (shift - 1) * t_mid)
 
-                        t[mid_mask] = t_mid
+                        t_cpu[mid_mask_cpu] = t_mid
 
                     # Generate logsnr samples for selected indices (7.5%)
-                    if logsnr_mask.any():
-                        logsnr_count = logsnr_mask.sum().item()
+                    if logsnr_mask_cpu.any():
+                        logsnr_count = logsnr_mask_cpu.sum().item()
+                        # Extract CPU tensors for logsnr_mask indices if org_timesteps provided
+                        org_timesteps_logsnr = None
+                        if org_timesteps is not None:
+                            org_timesteps_cpu = org_timesteps.cpu() if org_timesteps.is_cuda else org_timesteps
+                            org_timesteps_logsnr = org_timesteps_cpu[logsnr_mask_cpu] if org_timesteps_cpu.numel() > 0 else None
                         logsnr = rand_logsnr(
                             logsnr_count,
                             args.logit_mean,
                             args.logit_std,
-                            org_timesteps[logsnr_mask] if org_timesteps is not None else None,
+                            org_timesteps_logsnr,
                         )
                         t_logsnr = torch.sigmoid(-logsnr / 2)
 
-                        t[logsnr_mask] = t_logsnr
+                        t_cpu[logsnr_mask_cpu] = t_logsnr
 
                     # Generate logsnr2 samples with -logit_mean for selected indices (12.5%)
-                    if logsnr_mask2.any():
-                        logsnr2_count = logsnr_mask2.sum().item()
+                    if logsnr_mask2_cpu.any():
+                        logsnr2_count = logsnr_mask2_cpu.sum().item()
+                        # Extract CPU tensors for logsnr_mask2 indices if org_timesteps provided
+                        org_timesteps_logsnr2 = None
+                        if org_timesteps is not None:
+                            org_timesteps_cpu = org_timesteps.cpu() if org_timesteps.is_cuda else org_timesteps
+                            org_timesteps_logsnr2 = org_timesteps_cpu[logsnr_mask2_cpu] if org_timesteps_cpu.numel() > 0 else None
                         logsnr2 = rand_logsnr(
-                            logsnr2_count, 5.36, 1.0, org_timesteps[logsnr_mask2] if org_timesteps is not None else None
+                            logsnr2_count, 5.36, 1.0, org_timesteps_logsnr2
                         )
                         t_logsnr2 = torch.sigmoid(-logsnr2 / 2)
 
-                        t[logsnr_mask2] = t_logsnr2
+                        t_cpu[logsnr_mask2_cpu] = t_logsnr2
+                    
+                    # Keep on CPU - caller will handle GPU transfer
+                    t = t_cpu
 
                 return t  # 0 to 1
 
@@ -944,37 +1044,93 @@ class NetworkTrainer:
             t_min /= 1000.0
             t_max /= 1000.0
 
+            # ROCm workaround: compute ALL operations on CPU to avoid GPU queue evictions
+            # GPU queue evictions cause SIGSEGV on Strix Halo (RDNA3.5)
+            from musubi_tuner.utils.device_utils import synchronize_device
+            synchronize_device(device)
+            
             if not args.preserve_distribution_shape:
-                t = compute_sampling_timesteps(timesteps)
-                t = t * (t_max - t_min) + t_min  # scale to [t_min, t_max], default [0, 1]
+                # ROCm workaround: ensure input to compute_sampling_timesteps is on CPU
+                timesteps_cpu_input = timesteps.cpu() if timesteps is not None and timesteps.is_cuda else timesteps
+                t = compute_sampling_timesteps(timesteps_cpu_input)
+                # Result should already be on CPU from our CPU-first workarounds, but ensure it
+                t_cpu = t.cpu() if t.is_cuda else t
+                t_cpu = t_cpu * (t_max - t_min) + t_min  # scale to [t_min, t_max], default [0, 1]
+                t = t_cpu.to(device=device, dtype=dtype)
+                synchronize_device(device)
             else:
                 max_loops = 1000
-                available_t = []
+                available_t_cpu = []  # Keep everything on CPU
                 for i in range(max_loops):
-                    t = None
+                    t_input = None
                     if self.num_timestep_buckets is not None:
-                        t = torch.tensor([self.get_bucketed_timestep() for _ in range(batch_size)], device=device)
-                    t = compute_sampling_timesteps(t)
-                    for t_i in t:
-                        if t_min <= t_i <= t_max:
-                            available_t.append(t_i)
-                        if len(available_t) == batch_size:
+                        # Create tensor on CPU, keep on CPU
+                        t_input = torch.tensor([self.get_bucketed_timestep() for _ in range(batch_size)], device="cpu")
+                    # ROCm workaround: compute_sampling_timesteps expects CPU input
+                    t_result = compute_sampling_timesteps(t_input)
+                    # Result should already be on CPU from our CPU-first workarounds, but ensure it
+                    t_result_cpu = t_result.cpu() if t_result.is_cuda else t_result
+                    for t_i in t_result_cpu:
+                        t_i_val = t_i.item() if isinstance(t_i, torch.Tensor) else float(t_i)
+                        if t_min <= t_i_val <= t_max:
+                            available_t_cpu.append(t_i_val)
+                        if len(available_t_cpu) == batch_size:
                             break
-                    if len(available_t) == batch_size:
+                    if len(available_t_cpu) == batch_size:
                         break
-                if len(available_t) < batch_size:
+                if len(available_t_cpu) < batch_size:
                     logger.warning(
                         f"Could not sample {batch_size} valid timesteps in {max_loops} loops / {max_loops}ループで{batch_size}個の有効なタイムステップをサンプリングできませんでした"
                     )
-                    available_t = compute_sampling_timesteps(timesteps)
-                else:
-                    t = torch.stack(available_t, dim=0)  # [batch_size, ]
+                    # Fallback: ensure timesteps is on CPU before calling compute_sampling_timesteps
+                    timesteps_cpu_fallback = timesteps.cpu() if timesteps is not None and timesteps.is_cuda else timesteps
+                    available_t_tensor = compute_sampling_timesteps(timesteps_cpu_fallback)
+                    available_t_tensor_cpu = available_t_tensor.cpu() if available_t_tensor.is_cuda else available_t_tensor
+                    available_t_cpu = [float(x.item() if isinstance(x, torch.Tensor) else x) for x in available_t_tensor_cpu]
+                
+                # Stack on CPU, then transfer to GPU at the end
+                t_cpu = torch.tensor(available_t_cpu, device="cpu")
+                t = t_cpu.to(device=device, dtype=dtype)
+                synchronize_device(device)
 
-            timesteps = t * 1000.0
-            t = t.view(-1, 1, 1, 1, 1) if latents.ndim == 5 else t.view(-1, 1, 1, 1)
-            noisy_model_input = (1 - t) * latents + t * noise
+            # ROCm workaround: compute timesteps on CPU
+            synchronize_device(device)
+            t_cpu = t.cpu() if t.is_cuda else t
+            timesteps_cpu = t_cpu * 1000.0
+            timesteps = timesteps_cpu.to(device=device, dtype=dtype)
+            synchronize_device(device)
+            
+            # ROCm workaround: compute ENTIRE noisy input calculation on CPU to avoid GPU queue evictions
+            # This is slower but prevents SIGSEGV from GPU queue evictions
+            synchronize_device(device)
+            
+            # Move all tensors to CPU for computation
+            t_cpu = t.cpu() if t.is_cuda else t
+            latents_cpu = latents.cpu() if latents.is_cuda else latents
+            noise_cpu = noise.cpu() if noise.is_cuda else noise
+            
+            # View operations on CPU
+            t_cpu = t_cpu.contiguous()
+            if latents.ndim == 5:
+                t_cpu = t_cpu.view(-1, 1, 1, 1, 1)
+            else:
+                t_cpu = t_cpu.view(-1, 1, 1, 1)
+            
+            # All arithmetic on CPU
+            one_minus_t_cpu = 1 - t_cpu
+            t_times_noise_cpu = t_cpu * noise_cpu
+            one_minus_t_times_latents_cpu = one_minus_t_cpu * latents_cpu
+            noisy_model_input_cpu = one_minus_t_times_latents_cpu + t_times_noise_cpu
+            
+            # Transfer final result back to GPU
+            noisy_model_input = noisy_model_input_cpu.to(device=device, dtype=latents.dtype)
+            synchronize_device(device)
 
-            timesteps += 1  # 1 to 1000
+            # ROCm workaround: compute timesteps increment on CPU
+            timesteps_cpu = timesteps.cpu() if timesteps.is_cuda else timesteps
+            timesteps_cpu = timesteps_cpu + 1  # 1 to 1000
+            timesteps = timesteps_cpu.to(device=device, dtype=dtype)
+            synchronize_device(device)
         else:
             # Sample a random timestep for each image
             # for weighting schemes where we sample timesteps non-uniformly
@@ -1835,7 +1991,12 @@ class NetworkTrainer:
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
         if args.gradient_checkpointing:
-            transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
+            # Check if trainer instance has custom gradient checkpointing method
+            # Note: trainer is the instance passed to train() method
+            if hasattr(self, "enable_gradient_checkpointing_if_requested"):
+                self.enable_gradient_checkpointing_if_requested(args, transformer)
+            elif hasattr(transformer, "enable_gradient_checkpointing"):
+                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
             network.enable_gradient_checkpointing()  # may have no effect
 
         # prepare optimizer, data loader etc.
@@ -2160,23 +2321,69 @@ class NetworkTrainer:
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
+            logger.info(f"Starting training loop for epoch {epoch + 1}, total batches: {len(train_dataloader)}")
             for step, batch in enumerate(train_dataloader):
+                if step % 10 == 0 or step == 0:
+                    logger.info(f"Processing batch {step}/{len(train_dataloader)} (accumulating gradients, will update progress after {args.gradient_accumulation_steps} batches)")
+                    sys.stdout.flush()
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
+                logger.info(f"Step {step}: Extracting latents from batch...")
+                sys.stdout.flush()
                 latents = batch["latents"]
+                logger.info(f"Step {step}: Latents extracted: {latents.shape}, device: {latents.device}")
+                sys.stdout.flush()
 
+                logger.info(f"Step {step}: Entering accelerator.accumulate context...")
+                sys.stdout.flush()
                 with accelerator.accumulate(training_model):
+                    logger.info(f"Step {step}: Inside accumulate context, calling on_step_start...")
+                    sys.stdout.flush()
                     accelerator.unwrap_model(network).on_step_start()
+                    logger.info(f"Step {step}: on_step_start completed")
+                    sys.stdout.flush()
 
+                    logger.info(f"Step {step}: Scaling/shifting latents...")
+                    sys.stdout.flush()
                     latents = self.scale_shift_latents(latents)
+                    logger.info(f"Step {step}: Latents scaled: {latents.shape}")
+                    sys.stdout.flush()
 
                     # Sample noise that we'll add to the latents
-                    noise = torch.randn_like(latents)
+                    # ROCm workaround: torch.randn_like on GPU causes SIGSEGV on Strix Halo
+                    # Generate on CPU first, then move to GPU for stability
+                    logger.info(f"Step {step}: Generating noise tensor...")
+                    sys.stdout.flush()
+                    from musubi_tuner.utils.device_utils import synchronize_device
+                    synchronize_device(accelerator.device)  # Ensure GPU is ready
+                    
+                    # ROCm SIGSEGV workaround: generate noise on CPU then transfer to GPU
+                    # Direct GPU random generation crashes on Strix Halo (RDNA3.5)
+                    # This is slower but stable
+                    latents_cpu = latents.cpu()
+                    noise_cpu = torch.randn_like(latents_cpu)
+                    noise = noise_cpu.to(device=accelerator.device, dtype=latents.dtype)
+                    synchronize_device(accelerator.device)
+                    
+                    logger.info(f"Step {step}: Noise generated: {noise.shape}, device: {noise.device}")
+                    sys.stdout.flush()
 
                     # calculate model input and timesteps
-                    noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
-                        args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
-                    )
+                    logger.info(f"Step {step}: Computing noisy model input and timesteps...")
+                    sys.stdout.flush()
+                    from musubi_tuner.utils.device_utils import synchronize_device
+                    synchronize_device(accelerator.device)  # Ensure GPU is ready before random operations
+                    try:
+                        noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
+                            args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+                        )
+                        synchronize_device(accelerator.device)
+                        logger.info(f"Step {step}: Noisy input: {noisy_model_input.shape}, timesteps: {timesteps.shape}")
+                        sys.stdout.flush()
+                    except Exception as e:
+                        logger.error(f"Step {step}: Error in get_noisy_model_input_and_timesteps: {e}", exc_info=True)
+                        sys.stdout.flush()
+                        raise
 
                     weighting = compute_loss_weighting_for_sd3(
                         args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
@@ -2223,9 +2430,12 @@ class NetworkTrainer:
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
                     if global_step == 0:
+                        logger.info("First optimization step completed, resetting progress bar")
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
+                    if global_step % 5 == 0:
+                        logger.info(f"Training progress: step {global_step}/{args.max_train_steps}")
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)

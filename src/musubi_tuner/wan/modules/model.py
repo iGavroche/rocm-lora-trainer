@@ -110,6 +110,10 @@ def rope_apply_inplace_cached(x, grid_sizes, freqs_list):
 
     n, c = x.size(2), x.size(3) // 2
 
+    # ROCm workaround: synchronize before RoPE operations to avoid queue evictions
+    if x.device.type == "cuda":
+        torch.cuda.synchronize(x.device)
+
     # loop over samples
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
@@ -124,6 +128,14 @@ def rope_apply_inplace_cached(x, grid_sizes, freqs_list):
 
         # inplace update
         x[i, :seq_len] = x_i.to(x.dtype)
+        
+        # ROCm workaround: synchronize after each sample to prevent queue buildup
+        if x.device.type == "cuda" and i % 4 == 0:  # Sync every 4 samples to reduce overhead
+            torch.cuda.synchronize(x.device)
+
+    # Final synchronization
+    if x.device.type == "cuda":
+        torch.cuda.synchronize(x.device)
 
     return x
 

@@ -160,12 +160,18 @@ For detailed information on specific architectures, configurations, and advanced
 
 Python 3.10 or later is required (verified with 3.10).
 
-Create a virtual environment and install PyTorch and torchvision matching your CUDA version. 
+Create a virtual environment and install PyTorch and torchvision matching your GPU platform. 
 
-PyTorch 2.5.1 or later is required (see [note](#PyTorch-version)).
+PyTorch 2.5.1 or later is required for CUDA (see [note](#PyTorch-version)). For ROCm/AMD GPUs, PyTorch 2.8.0+ is required (see [ROCm Requirements](#rocm--amd-gpu-strix-halo-requirements)).
 
+**For NVIDIA CUDA:**
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+```
+
+**For AMD ROCm (Strix Halo and other AMD GPUs):**
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.1
 ```
 
 Install the required dependencies using the following command.
@@ -259,11 +265,17 @@ These scripts include:
 
 **ROCm Setup (AMD GPUs):**
 
-For RDNA3.5 GPUs (e.g., Strix Halo) on ROCm, additional stability fixes may be needed:
+For RDNA3.5 GPUs (e.g., Strix Halo) on ROCm, see the [ROCm Requirements](#rocm--amd-gpu-strix-halo-requirements) section above for PyTorch installation and system requirements.
 
-1. **Environment Variable** (applied automatically in scripts):
+The training scripts automatically apply required environment variables for ROCm stability. For manual setup:
+
+1. **Environment Variables** (applied automatically in training scripts):
    ```bash
    export HSA_XNACK=0
+   export HSA_ENABLE_SDMA=0
+   export HSA_AMD_SDMA_ENABLE=0
+   export HIP_VISIBLE_DEVICES=0
+   export PYTORCH_ROCM_FORCE_STREAM_ORDERED_ALLOCATOR=1
    ```
 
 2. **Kernel Parameters** (requires reboot):
@@ -305,6 +317,36 @@ This completes the SageAttention installation.
 If you specify `torch` for `--attn_mode`, use PyTorch 2.5.1 or later (earlier versions may result in black videos).
 
 If you use an earlier version, use xformers or SageAttention.
+
+#### ROCm / AMD GPU (Strix Halo) Requirements
+
+For AMD GPUs using ROCm, especially RDNA3.5 GPUs like Strix Halo (gfx1151), use **PyTorch 2.8.0 stable** or later with ROCm 7.1+.
+
+**Installation for ROCm:**
+
+```bash
+# Install PyTorch 2.8.0+ with ROCm support
+pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.1
+```
+
+**Important Notes for Strix Halo:**
+
+- **PyTorch 2.8.0 stable** is recommended and tested. Development builds (e.g., `2.10.0a0`) may have stability issues.
+- Ensure you have the correct ROCm version installed (7.1+ recommended).
+- The training scripts automatically set required environment variables for ROCm stability:
+  - `HSA_XNACK=0` - Disables XNACK for RDNA3.5 stability
+  - `HSA_ENABLE_SDMA=0` - Disables SDMA to fix allocation faults
+  - `HSA_AMD_SDMA_ENABLE=0` - Additional SDMA disable
+  - `HIP_VISIBLE_DEVICES=0` - Forces single device
+  - `PYTORCH_ROCM_FORCE_STREAM_ORDERED_ALLOCATOR=1` - Uses new allocator
+
+**System Requirements (recommended for best stability):**
+- Kernel: 6.16.9+ (for full VRAM recognition and stability)
+- ROCm: 7.9+ (when available) or 7.1+ (current minimum)
+- Firmware: GC 11.5.1 with MES workaround enabled
+- Kernel parameter: `amdgpu.cwsr_enable=0` (check: `cat /proc/cmdline | grep cwsr`)
+
+For more details on ROCm setup, see the [ROCm Compatibility Rules](.cursor/rules/rocm-compatibility.mdc) in the repository.
 
 ## Disclaimer
 

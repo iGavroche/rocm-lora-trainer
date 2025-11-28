@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from safetensors.torch import load_file
+from musubi_tuner.utils.safetensors_utils import load_safetensors
 
 __all__ = [
     "WanVAE",
@@ -646,7 +646,8 @@ def _video_vae(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
     # load checkpoint
     logging.info(f"loading {pretrained_path}")
     if os.path.splitext(pretrained_path)[-1] == ".safetensors":
-        sd = load_file(pretrained_path)
+        # Use memory-efficient loader for safetensors 0.7.0+ compatibility
+        sd = load_safetensors(pretrained_path, device=device, disable_mmap=False)
         model.load_state_dict(sd, strict=False, assign=True)
     else:
         model.load_state_dict(torch.load(pretrained_path, map_location=device, weights_only=True), assign=True)

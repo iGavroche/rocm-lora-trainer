@@ -247,22 +247,53 @@ def load_safetensors_with_fp8_optimization_and_hook(
             f"Loading state dict without FP8 optimization. Dtype of weight: {dit_weight_dtype}, hook enabled: {weight_hook is not None}"
         )
         state_dict = {}
+        import sys
+        import gc
+        from musubi_tuner.utils.device_utils import clean_memory_on_device
         for model_file in model_files:
             with MemoryEfficientSafeOpen(model_file, disable_numpy_memmap=disable_numpy_memmap) as f:
-                for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", leave=False):
-                    if weight_hook is None and move_to_device:
-                        value = f.get_tensor(key, device=calc_device, dtype=dit_weight_dtype)
-                    else:
-                        value = f.get_tensor(key)  # we cannot directly load to device because get_tensor does non-blocking transfer
-                        if weight_hook is not None:
-                            value = weight_hook(key, value, keep_on_calc_device=move_to_device)
-                        if move_to_device:
-                            value = value.to(calc_device, dtype=dit_weight_dtype, non_blocking=True)
-                        elif dit_weight_dtype is not None:
+                keys = list(f.keys())
+                # Load and transfer immediately to avoid accumulating CPU memory
+                # On UMA systems, this is more memory-efficient
+                if move_to_device:
+                    logger.info(f"Loading and transferring {len(keys)} tensors from {os.path.basename(model_file)} to {calc_device}...")
+                    pbar = tqdm(keys, desc=f"Loading {os.path.basename(model_file)}", leave=True, mininterval=0.1, file=sys.stdout)
+                else:
+                    logger.info(f"Loading {len(keys)} tensors from {os.path.basename(model_file)} to CPU...")
+                    pbar = tqdm(keys, desc=f"Loading {os.path.basename(model_file)}", leave=False)
+                
+                try:
+                    for i, key in enumerate(pbar):
+                        # Load to CPU first
+                        value = f.get_tensor(key)  # Load to CPU
+                        if dit_weight_dtype is not None:
                             value = value.to(dit_weight_dtype)
-
-                    state_dict[key] = value
-        if move_to_device:
-            synchronize_device(calc_device)
+                        
+                        # Transfer to GPU immediately if needed, then delete CPU copy
+                        if move_to_device:
+                            state_dict[key] = value.to(calc_device, non_blocking=True)
+                            del value  # Free CPU memory immediately
+                            # Synchronize periodically to avoid queue buildup
+                            if (i + 1) % 50 == 0:  # Every 50 tensors
+                                synchronize_device(calc_device)
+                                if (i + 1) % 200 == 0:  # Every 200 tensors, clear cache
+                                    clean_memory_on_device(calc_device)
+                                    gc.collect()
+                        else:
+                            state_dict[key] = value
+                finally:
+                    pbar.close()
+                    sys.stdout.flush()
+                    if move_to_device:
+                        # Final synchronization and cleanup
+                        synchronize_device(calc_device)
+                        clean_memory_on_device(calc_device)
+                        gc.collect()
+                
+                # Apply weight hook after device transfer if needed
+                if weight_hook is not None:
+                    logger.info("Applying weight hook...")
+                    for key in tqdm(state_dict.keys(), desc="Applying hook", leave=False):
+                        state_dict[key] = weight_hook(key, state_dict[key], keep_on_calc_device=move_to_device)
 
     return state_dict
