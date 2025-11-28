@@ -7,7 +7,7 @@ source .venv/bin/activate
 # Configuration
 DATASET_CONFIG="dataset.toml"
 OUTPUT_DIR="outputs"
-OUTPUT_NAME="chani_test_attn"
+OUTPUT_NAME="wan22_14B_i2v_test_attn"
 MAX_EPOCHS=1  # Just 1 epoch for testing
 LEARNING_RATE=2e-4
 NETWORK_DIM=16

@@ -26,8 +26,8 @@ else
 fi
 
 echo ""
-echo "To resume training, set RESUME_PATH in train_chani_full.sh:"
-echo "  RESUME_PATH=\"outputs/chani_full-000001-state\""
+echo "To resume training, set RESUME_PATH in train_wan22_14B_i2v_full.sh:"
+echo "  RESUME_PATH=\"outputs/wan22_14B_i2v_full-000001-state\""
 echo ""
 echo "Or use the latest checkpoint:"
 LATEST_STATE=$(ls -td "$OUTPUT_DIR"/*-state* "$OUTPUT_DIR"/*-*-state 2>/dev/null | head -1)
