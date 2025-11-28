@@ -1,5 +1,5 @@
-# PowerShell script to run WAN 2.2 I2V LoRA training for Chani
-# This script calls the bash script train_chani_full.sh
+# PowerShell script to run WAN 2.2 I2V LoRA training
+# This script calls the bash script train_wan22_14B_i2v_full.sh
 
 param(
     [string]$ResumePath = ""
@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "WAN 2.2 I2V LoRA Training for Chani" -ForegroundColor Cyan
+Write-Host "WAN 2.2 I2V LoRA Training" -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -22,7 +22,7 @@ if ($IsWindows -or $env:OS -eq "Windows_NT") {
     
     if ($wslPath) {
         Write-Host "Using WSL to run bash script..." -ForegroundColor Green
-        $scriptPath = "train_chani_full.sh"
+        $scriptPath = "train_wan22_14B_i2v_full.sh"
         
         if ($ResumePath) {
             wsl bash -c "cd /mnt/$($PWD.Drive.Name.ToLower())/$($PWD.Path.Replace(':', '').Replace('\', '/')) && export RESUME_PATH='$ResumePath' && bash $scriptPath"
@@ -32,7 +32,7 @@ if ($IsWindows -or $env:OS -eq "Windows_NT") {
     }
     elseif ($bashPath) {
         Write-Host "Using Git Bash to run bash script..." -ForegroundColor Green
-        $scriptPath = Join-Path $PWD "train_chani_full.sh"
+        $scriptPath = Join-Path $PWD "train_wan22_14B_i2v_full.sh"
         
         if ($ResumePath) {
             $env:RESUME_PATH = $ResumePath
@@ -49,7 +49,7 @@ if ($IsWindows -or $env:OS -eq "Windows_NT") {
         Write-Host "  2. Git Bash (comes with Git for Windows)" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "Alternatively, you can run the bash script directly:" -ForegroundColor Yellow
-        Write-Host "  bash train_chani_full.sh" -ForegroundColor White
+        Write-Host "  bash train_wan22_14B_i2v_full.sh" -ForegroundColor White
         exit 1
     }
 }
@@ -61,7 +61,7 @@ else {
         $env:RESUME_PATH = $ResumePath
     }
     
-    bash train_chani_full.sh
+    bash train_wan22_14B_i2v_full.sh
 }
 
 Write-Host ""

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Train chani LoRA using WAN 2.2 T2V with MINIMAL settings for proof of concept
+# Train WAN 2.2 T2V LoRA with MINIMAL settings for proof of concept
 # This uses lower quality settings to minimize computation while still getting results
 
 # Activate virtual environment
@@ -8,7 +8,7 @@ source .venv/bin/activate
 # Configuration
 DATASET_CONFIG="dataset_minimal.toml"
 OUTPUT_DIR="outputs"
-OUTPUT_NAME="chani_minimal"
+OUTPUT_NAME="wan22_14B_t2v_minimal"
 
 # Model paths
 VAE_PATH="models/wan/wan_2.1_vae.safetensors"
@@ -31,7 +31,7 @@ MIXED_PRECISION="fp16"
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-echo "Starting MINIMAL WAN 2.2 LoRA training for chani (Proof of Concept)..."
+echo "Starting MINIMAL WAN 2.2 LoRA training (Proof of Concept)..."
 echo "Dataset: $DATASET_CONFIG"
 echo "Output: $OUTPUT_DIR/$OUTPUT_NAME"
 echo ""
@@ -73,7 +73,7 @@ echo ""
 echo "Minimal training complete!"
 echo "LoRA saved to $OUTPUT_DIR/$OUTPUT_NAME.safetensors"
 echo ""
-echo "You can now test this LoRA with generate_chani_video.sh"
-echo "For better quality, use train_chani.sh with higher settings"
+echo "You can now test this LoRA with generate_wan22_14B_i2v.sh"
+echo "For better quality, use train_wan22_14B_i2v.sh with higher settings"
 
 

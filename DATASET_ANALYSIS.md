@@ -1,4 +1,4 @@
-# Training Dataset Analysis for Chani LoRA
+# Training Dataset Analysis for WAN 2.2 LoRA
 
 ## Dataset Overview ✅
 
@@ -14,11 +14,11 @@
 ### Captions
 All images have proper .txt caption files with consistent format:
 ```
-Chani, 32 year old woman, [expression], [hair], [clothing], [lighting]
+[Subject description], [expression], [hair], [clothing], [lighting]
 ```
 
 **Good points:**
-- Consistent subject identity ("Chani, 32 year old woman")
+- Consistent subject identity
 - Varied expressions (calm, neutral, gentle smile, serene)
 - Varied hair descriptions (wavy, long, medium length, shoulder length)
 - Varied clothing (casual outfit, everyday clothing, simple wear, dark clothing)
@@ -42,7 +42,7 @@ enable_bucket = true
 
 ### Training Settings Recommendation
 
-**Option 1: Quick Quality (train_chani_minimal.sh)**
+**Option 1: Quick Quality (train_wan22_14B_i2v_minimal.sh)**
 - Epochs: 2
 - Rank: 16
 - Learning rate: 1e-4
@@ -56,7 +56,7 @@ enable_bucket = true
 - Time: ~40 minutes
 - Quality: ⭐⭐⭐⭐ (good balance)
 
-**Option 3: Full Quality (train_chani_full.sh)**
+**Option 3: Full Quality (train_wan22_14B_i2v_full.sh)**
 - Epochs: 10
 - Rank: 32
 - Learning rate: 2e-4
@@ -81,16 +81,16 @@ Your dataset is **ready** for training. Choose your training script:
 
 ```bash
 # Quick proof of concept (~13 min)
-./train_chani_minimal.sh
+./train_wan22_14B_i2v_minimal.sh
 
 # Or balanced quality (~40 min)
-./train_chani_full.sh  # (but adjust epochs to 6 for balanced)
+./train_wan22_14B_i2v_full.sh  # (but adjust epochs to 6 for balanced)
 ```
 
 ## Training Commands Available
 
-1. `train_chani_minimal.sh` - Minimal compute (2 epochs, rank 16)
-2. `train_chani_full.sh` - Full quality (10 epochs, rank 32)
+1. `train_wan22_14B_i2v_minimal.sh` - Minimal compute (2 epochs, rank 16)
+2. `train_wan22_14B_i2v_full.sh` - Full quality (10 epochs, rank 32)
 3. Generate new balanced script with 6 epochs + rank 32
 
 

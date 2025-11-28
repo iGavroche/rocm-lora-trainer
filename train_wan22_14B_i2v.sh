@@ -1,11 +1,11 @@
 #!/bin/bash
-# Train chani LoRA using WAN 2.2 T2V with cached latents
-# This script trains a LoRA on the myface dataset using cached latents
+# Train WAN 2.2 T2V LoRA with cached latents
+# This script trains a LoRA using cached latents
 
 # Configuration
 DATASET_CONFIG="dataset.toml"
 OUTPUT_DIR="outputs"
-OUTPUT_NAME="chani"
+OUTPUT_NAME="wan22_14B_t2v"
 
 # Model paths
 VAE_PATH="models/wan/wan_2.1_vae.safetensors"
@@ -28,7 +28,7 @@ MIXED_PRECISION="bf16"
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-echo "Starting WAN 2.2 LoRA training for chani..."
+echo "Starting WAN 2.2 LoRA training..."
 echo "Dataset: $DATASET_CONFIG"
 echo "Output: $OUTPUT_DIR/$OUTPUT_NAME"
 

@@ -1,12 +1,12 @@
 #!/bin/bash
-# Generate video with chani LoRA using WAN 2.2 T2V
+# Generate video with WAN 2.2 T2V LoRA
 # Note: Using musubi-tuner (not diffsynth)
 
 # Activate virtual environment
 source .venv/bin/activate
 
 # Set paths
-LORA_PATH="/home/nino/projects/musubi-tuner/outputs/chani_minimal.safetensors"
+LORA_PATH="/home/nino/projects/musubi-tuner/outputs/wan22_14B_t2v_minimal.safetensors"
 T5_PATH="/home/nino/projects/musubi-tuner/models/wan/umt5-xxl-enc-bf16.safetensors"
 VAE_PATH="/home/nino/projects/musubi-tuner/models/wan/wan_2.1_vae.safetensors"
 DIT_LOW_NOISE="/home/nino/projects/musubi-tuner/models/wan/wan2.2_t2v_low_noise_14B_fp16.safetensors"
@@ -16,10 +16,10 @@ DIT_HIGH_NOISE="/home/nino/projects/musubi-tuner/models/wan/wan2.2_t2v_high_nois
 OUTPUT_DIR="outputs"
 mkdir -p "$OUTPUT_DIR"
 
-echo "Generating video with chani LoRA using musubi-tuner..."
+echo "Generating video with WAN 2.2 LoRA using musubi-tuner..."
 echo "LoRA: $LORA_PATH"
 
-# Generate video with chani character using WAN 2.2 14B model
+# Generate video using WAN 2.2 14B model
 python src/musubi_tuner/wan_generate_video.py \
     --task t2v-A14B \
     --dit "$DIT_LOW_NOISE" \
@@ -32,12 +32,12 @@ python src/musubi_tuner/wan_generate_video.py \
     --video_length 9 \
     --fps 8 \
     --infer_steps 10 \
-    --prompt "Chani, 32 year old woman, blond with blue eyes, beautiful, calm expression, wavy hair, pretty wear, normal lighting" \
+    --prompt "A person, beautiful, calm expression, wavy hair, pretty wear, normal lighting" \
     --guidance_scale 5.0 \
-    --save_path "$OUTPUT_DIR/chani_output.mp4" \
+    --save_path "$OUTPUT_DIR/wan22_14B_i2v_output.mp4" \
     --output_type both \
     --attn_mode torch
 
-echo "Video generation complete. Output saved to $OUTPUT_DIR/chani_output.mp4"
+echo "Video generation complete. Output saved to $OUTPUT_DIR/wan22_14B_i2v_output.mp4"
 echo "This LoRA is trained with musubi and is compatible with ComfyUI format."
 

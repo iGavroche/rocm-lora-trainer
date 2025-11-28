@@ -1,10 +1,10 @@
-# Generate Video with Chani LoRA using WAN 2.2
+# Generate Video with WAN 2.2 I2V LoRA
 
-This guide explains how to generate videos with your trained chani LoRA using musubi-tuner.
+This guide explains how to generate videos with your trained WAN 2.2 I2V LoRA using musubi-tuner.
 
 ## Overview
 
-- **LoRA Model**: Trained with musubi-tuner (located at `/home/nino/projects/wantraining/comfyui_lora/chani.safetensors`)
+- **LoRA Model**: Trained with musubi-tuner (replace with your LoRA path)
 - **Base Model**: WAN 2.2 Ti2V 14B (note: musubi-tuner supports 14B models, not 5B)
 - **Compatibility**: The LoRA is in ComfyUI format and is compatible with ComfyUI
 
@@ -13,16 +13,16 @@ This guide explains how to generate videos with your trained chani LoRA using mu
 Run the generation script:
 
 ```bash
-./generate_chani_video.sh
+./generate_wan22_14B_i2v.sh
 ```
 
 This will:
 1. Load the WAN 2.2 low-noise and high-noise models
-2. Apply the chani LoRA with multiplier 1.0
+2. Apply the LoRA with multiplier 1.0
 3. Generate a 81-frame video at 512x512 resolution
 4. Save output as both video file and individual frames
 
-Output will be saved to `outputs/chani_output.mp4`
+Output will be saved to `outputs/wan22_14B_i2v_output.mp4`
 
 ## Manual Generation
 
@@ -35,15 +35,15 @@ python src/musubi_tuner/wan_generate_video.py \
     --dit_high_noise models/wan/wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors \
     --vae models/wan/wan_2.1_vae.safetensors \
     --t5 models/wan/umt5-xxl-enc-bf16.safetensors \
-    --lora_weight /home/nino/projects/wantraining/comfyui_lora/chani.safetensors \
+    --lora_weight outputs/wan22_14B_i2v_full.safetensors \
     --lora_multiplier 1.0 \
     --video_size 512 512 \
     --video_length 81 \
     --fps 16 \
     --infer_steps 20 \
-    --prompt "Chani, 32 year old woman, blond with blue eyes, beautiful, calm expression, wavy hair, pretty wear, normal lighting" \
+    --prompt "A person, beautiful, calm expression, wavy hair, pretty wear, normal lighting" \
     --guidance_scale 5.0 \
-    --save_path outputs/chani_output.mp4 \
+    --save_path outputs/wan22_14B_i2v_output.mp4 \
     --output_type both \
     --attn_mode torch \
     --fp8 \
@@ -91,9 +91,9 @@ To generate multiple videos, create a prompts file:
 ```bash
 # Create prompts.txt
 cat > prompts.txt << EOF
-Chani, 32 year old woman, blond with blue eyes, beautiful, calm expression, wavy hair, pretty wear, normal lighting
-Chani walking through a garden --w 832 --h 480 --f 49
-Chani in a modern apartment --w 512 --h 768
+A person, beautiful, calm expression, wavy hair, pretty wear, normal lighting
+A person walking through a garden --w 832 --h 480 --f 49
+A person in a modern apartment --w 512 --h 768
 EOF
 
 # Run batch generation
@@ -104,7 +104,7 @@ python src/musubi_tuner/wan_generate_video.py \
     --dit_high_noise models/wan/wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors \
     --vae models/wan/wan_2.1_vae.safetensors \
     --t5 models/wan/umt5-xxl-enc-bf16.safetensors \
-    --lora_weight /home/nino/projects/wantraining/comfyui_lora/chani.safetensors \
+    --lora_weight outputs/wan22_14B_i2v_full.safetensors \
     --save_path outputs
 ```
 
@@ -133,17 +133,17 @@ Check:
 ## Notes
 
 - The WAN 2.2 architecture in musubi-tuner supports **14B models**, not 5B models
-- Your chani LoRA is trained with musubi-tuner and is already in ComfyUI-compatible format
+- Your LoRA is trained with musubi-tuner and is already in ComfyUI-compatible format
 - The `--cpu_noise` flag ensures same results as ComfyUI for the same seed
 - The LoRA multiplier controls how strongly the LoRA affects the generation (1.0 = full strength)
 
 ## Using in ComfyUI
 
-Your LoRA file at `/home/nino/projects/wantraining/comfyui_lora/chani.safetensors` can be directly used in ComfyUI:
+Your LoRA file can be directly used in ComfyUI:
 
 1. Copy the file to your ComfyUI models/loras directory
 2. Use any WAN 2.2 Ti2V node in ComfyUI
-3. Add the LoRA node and select your chani LoRA
+3. Add the LoRA node and select your LoRA
 4. Set the multiplier (e.g., 1.0 for full strength)
 
 

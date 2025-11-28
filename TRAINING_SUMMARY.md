@@ -1,4 +1,4 @@
-# Training Summary - Chani LoRA
+# Training Summary - WAN 2.2 LoRA
 
 ## Current Status
 
@@ -6,11 +6,11 @@ You have two working training setups:
 
 ### ✅ 1. WAN 2.2 (Video Training) - WORKING
 **Status:** ✅ Fully working, trained successfully  
-**Location:** `outputs/chani_minimal.safetensors` (2 epochs proof of concept)
+**Location:** `outputs/wan22_14B_t2v_minimal.safetensors` (2 epochs proof of concept)
 
 #### What worked:
 - Training completed successfully (13 minutes)
-- Using: `train_chani_minimal.sh`
+- Using: `train_wan22_14B_i2v_minimal.sh`
 - Optimizations for ROCm:
   - Use `adamw` (not `adamw8bit`) 
   - Use `fp16` mixed precision (not `bf16`)
@@ -18,9 +18,9 @@ You have two working training setups:
   - Remove `--gradient_checkpointing_cpu_offload`
 
 #### Available training scripts:
-- `train_chani_minimal.sh` - 2 epochs, ~13 min ✅ PROOF OF CONCEPT DONE
-- `train_chani_fast.sh` - 3 epochs, ~3 hours
-- `train_chani_full.sh` - 6 epochs, ~24 hours
+- `train_wan22_14B_i2v_minimal.sh` - 2 epochs, ~13 min ✅ PROOF OF CONCEPT DONE
+- `train_wan22_14B_i2v_fast.sh` - 3 epochs, ~3 hours
+- `train_wan22_14B_i2v_full.sh` - 6 epochs, ~24 hours
 
 ### ❌ 2. FLUX Kontext (Image Training) - NOT WORKING
 **Status:** ❌ Incompatible model format  
@@ -42,9 +42,9 @@ You have two working training setups:
 ### For better quality with WAN:
 Run with more epochs:
 ```bash
-./train_chani_fast.sh  # 3 epochs, ~3 hours, good balance
+./train_wan22_14B_i2v_fast.sh  # 3 epochs, ~3 hours, good balance
 # OR
-./train_chani_full.sh  # 6 epochs, ~24 hours, best quality
+./train_wan22_14B_i2v_full.sh  # 6 epochs, ~24 hours, best quality
 ```
 
 ### Why WAN video training works for faces:
@@ -67,9 +67,9 @@ Run with more epochs:
 
 ## Next Steps
 
-1. **Quick test:** Continue with `chani_minimal.safetensors` (already done)
-2. **Better quality:** Run `./train_chani_fast.sh` (3 epochs, ~3 hours)
-3. **Best quality:** Run `./train_chani_full.sh` (6 epochs, ~24 hours)
+1. **Quick test:** Continue with `wan22_14B_t2v_minimal.safetensors` (already done)
+2. **Better quality:** Run `./train_wan22_14B_i2v_fast.sh` (3 epochs, ~3 hours)
+3. **Best quality:** Run `./train_wan22_14B_i2v_full.sh` (6 epochs, ~24 hours)
 
 ## Note on FLUX
 

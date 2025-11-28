@@ -1,11 +1,11 @@
 #!/bin/bash
-# Train chani LoRA using FLUX.1 Kontext with minimal settings for fast iteration
+# Train FLUX.1 Kontext LoRA with minimal settings for fast iteration
 
 source .venv/bin/activate
 
 DATASET_CONFIG="dataset_flux.toml"
 OUTPUT_DIR="outputs"
-OUTPUT_NAME="chani_flux"
+OUTPUT_NAME="flux_kontext"
 
 # Model paths - copied from ComfyUI
 DIT_PATH="/home/nino/ComfyUI/models/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors"
@@ -24,7 +24,7 @@ MIXED_PRECISION="bf16"       # FLUX recommends bf16
 
 mkdir -p "$OUTPUT_DIR"
 
-echo "Starting FLUX Kontext LoRA training for chani..."
+echo "Starting FLUX Kontext LoRA training..."
 echo "Dataset: $DATASET_CONFIG"
 echo "Output: $OUTPUT_DIR/$OUTPUT_NAME"
 echo "Epochs: 4 (estimated time: ~2-3 hours)"

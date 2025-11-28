@@ -1,12 +1,12 @@
 #!/bin/bash
-# Train chani LoRA - FAST version with reduced compute
+# Train WAN 2.2 T2V LoRA - FAST version with reduced compute
 # Reduced epochs and optimized settings for speed
 
 source .venv/bin/activate
 
 DATASET_CONFIG="dataset.toml"
 OUTPUT_DIR="outputs"
-OUTPUT_NAME="chani_fast"
+OUTPUT_NAME="wan22_14B_t2v_fast"
 
 VAE_PATH="models/wan/wan_2.1_vae.safetensors"
 T5_PATH="models/wan/umt5-xxl-enc-bf16.safetensors"
@@ -25,7 +25,7 @@ MIXED_PRECISION="fp16"
 
 mkdir -p "$OUTPUT_DIR"
 
-echo "Starting FAST WAN 2.2 LoRA training for chani..."
+echo "Starting FAST WAN 2.2 LoRA training..."
 echo "Dataset: $DATASET_CONFIG (48 images, 5 repeats = 240 steps per epoch)"
 echo "Output: $OUTPUT_DIR/$OUTPUT_NAME"
 echo "Epochs: 3 (estimated time: ~3 hours total)"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Train chani LoRA using WAN 2.2 I2V with SAFE settings to prevent driver crashes
+# Train WAN 2.2 I2V LoRA with SAFE settings to prevent driver crashes
 # Using only low-noise model to reduce memory pressure on ROCm
 
 # Activate virtual environment
@@ -28,7 +28,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Configuration
 DATASET_CONFIG="dataset.toml"  # Using full dataset config with 5 repeats
 OUTPUT_DIR="outputs"
-OUTPUT_NAME="chani_full"
+OUTPUT_NAME="wan22_14B_i2v_full"
 
 # Model paths
 VAE_PATH="models/wan/wan_2.1_vae.safetensors"
@@ -61,7 +61,7 @@ PERSISTENT_WORKERS=false     # Disabled: causes SIGSEGV with older accelerate ve
 SAVE_EVERY_N_EPOCHS=1       # Save less frequently to reduce I/O overhead
 
 # Resume training (set to path of state directory to resume, or leave empty to start fresh)
-# Example: RESUME_PATH="outputs/chani_full-000001-state"
+# Example: RESUME_PATH="outputs/wan22_14B_i2v_full-000001-state"
 # To find available checkpoints: ls -d outputs/*-state* outputs/*-*-state
 RESUME_PATH=""              # Leave empty to start new training
 
@@ -69,10 +69,10 @@ RESUME_PATH=""              # Leave empty to start new training
 mkdir -p "$OUTPUT_DIR"
 
 if [ -n "$RESUME_PATH" ]; then
-    echo "RESUMING WAN 2.2 I2V LoRA training for chani..."
+    echo "RESUMING WAN 2.2 I2V LoRA training..."
     echo "Resuming from: $RESUME_PATH"
 else
-    echo "Starting OPTIMIZED WAN 2.2 I2V LoRA training for chani..."
+    echo "Starting OPTIMIZED WAN 2.2 I2V LoRA training..."
 fi
 echo "Dataset: $DATASET_CONFIG (48 images, 5 repeats = 240 steps per epoch)"
 echo "Output: $OUTPUT_DIR/$OUTPUT_NAME"

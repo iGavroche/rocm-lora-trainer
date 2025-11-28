@@ -254,8 +254,8 @@ Training and inference procedures vary significantly by architecture. Please ref
 
 For a complete example of training a LoRA with WAN 2.2 I2V, see the training scripts in the repository root:
 
-- **Linux/Mac**: `train_chani_full.sh` - Bash script for WAN 2.2 I2V LoRA training
-- **Windows**: `train_chani_full.ps1` - PowerShell wrapper that calls the bash script via WSL or Git Bash
+- **Linux/Mac**: `train_wan22_14B_i2v_full.sh` - Bash script for WAN 2.2 I2V LoRA training
+- **Windows**: `train_wan22_14B_i2v_full.ps1` - PowerShell wrapper that calls the bash script via WSL or Git Bash
 
 These scripts include:
 - ROCm stability optimizations (HSA_XNACK=0, kernel parameters)
@@ -284,7 +284,7 @@ The training scripts automatically apply required environment variables for ROCm
    ```
    This adds: `amdgpu.noretry=0 amdgpu.gpu_recovery=1 amdgpu.isolation=0`
 
-See `train_chani_full.sh` and `apply_rocm_kernel_params.sh` for implementation details.
+See `train_wan22_14B_i2v_full.sh` and `apply_rocm_kernel_params.sh` for implementation details.
 
 ## Miscellaneous
 
