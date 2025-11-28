@@ -22,7 +22,7 @@ You're currently testing `--xformers`. According to the code:
 
 ### Option 1: Quick Manual Test (Current Setup)
 
-Edit `train_chani_full.sh` line 104 to test different combinations:
+Edit `train_wan22_14B_i2v_full.sh` line 104 to test different combinations:
 
 ```bash
 # Test 1: xformers with split_attn (RECOMMENDED)

@@ -28,7 +28,7 @@ check_process() {
 }
 
 # Run generation in background and capture all output
-bash generate_chani_video.sh > >(tee -a "$LOG_FILE") 2> >(tee -a "$ERROR_LOG" >&2) &
+bash generate_wan22_14B_i2v.sh > >(tee -a "$LOG_FILE") 2> >(tee -a "$ERROR_LOG" >&2) &
 GENERATION_PID=$!
 
 echo "Generation started with PID: $GENERATION_PID"
@@ -59,9 +59,9 @@ echo ""
 echo "Generation process finished with exit code: $EXIT_CODE"
 
 # Check if output file was created
-if [ -f "outputs/chani_output.mp4" ]; then
-    echo "✅ Video generated successfully: outputs/chani_output.mp4"
-    ls -lh outputs/chani_output.mp4
+if [ -f "outputs/wan22_14B_i2v_output.mp4" ]; then
+    echo "✅ Video generated successfully: outputs/wan22_14B_i2v_output.mp4"
+    ls -lh outputs/wan22_14B_i2v_output.mp4
 else
     echo "❌ Video file not found!"
     echo "Last 30 lines of log:"
