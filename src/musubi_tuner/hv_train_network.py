@@ -2323,37 +2323,45 @@ class NetworkTrainer:
 
             logger.info(f"Starting training loop for epoch {epoch + 1}, total batches: {len(train_dataloader)}")
             for step, batch in enumerate(train_dataloader):
-                if step % 10 == 0 or step == 0:
+                if args.debug and (step % 10 == 0 or step == 0):
                     logger.info(f"Processing batch {step}/{len(train_dataloader)} (accumulating gradients, will update progress after {args.gradient_accumulation_steps} batches)")
                     sys.stdout.flush()
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
-                logger.info(f"Step {step}: Extracting latents from batch...")
-                sys.stdout.flush()
+                if args.debug:
+                    logger.info(f"Step {step}: Extracting latents from batch...")
+                    sys.stdout.flush()
                 latents = batch["latents"]
-                logger.info(f"Step {step}: Latents extracted: {latents.shape}, device: {latents.device}")
-                sys.stdout.flush()
+                if args.debug:
+                    logger.info(f"Step {step}: Latents extracted: {latents.shape}, device: {latents.device}")
+                    sys.stdout.flush()
 
-                logger.info(f"Step {step}: Entering accelerator.accumulate context...")
-                sys.stdout.flush()
+                if args.debug:
+                    logger.info(f"Step {step}: Entering accelerator.accumulate context...")
+                    sys.stdout.flush()
                 with accelerator.accumulate(training_model):
-                    logger.info(f"Step {step}: Inside accumulate context, calling on_step_start...")
-                    sys.stdout.flush()
+                    if args.debug:
+                        logger.info(f"Step {step}: Inside accumulate context, calling on_step_start...")
+                        sys.stdout.flush()
                     accelerator.unwrap_model(network).on_step_start()
-                    logger.info(f"Step {step}: on_step_start completed")
-                    sys.stdout.flush()
+                    if args.debug:
+                        logger.info(f"Step {step}: on_step_start completed")
+                        sys.stdout.flush()
 
-                    logger.info(f"Step {step}: Scaling/shifting latents...")
-                    sys.stdout.flush()
+                    if args.debug:
+                        logger.info(f"Step {step}: Scaling/shifting latents...")
+                        sys.stdout.flush()
                     latents = self.scale_shift_latents(latents)
-                    logger.info(f"Step {step}: Latents scaled: {latents.shape}")
-                    sys.stdout.flush()
+                    if args.debug:
+                        logger.info(f"Step {step}: Latents scaled: {latents.shape}")
+                        sys.stdout.flush()
 
                     # Sample noise that we'll add to the latents
                     # ROCm workaround: torch.randn_like on GPU causes SIGSEGV on Strix Halo
                     # Generate on CPU first, then move to GPU for stability
-                    logger.info(f"Step {step}: Generating noise tensor...")
-                    sys.stdout.flush()
+                    if args.debug:
+                        logger.info(f"Step {step}: Generating noise tensor...")
+                        sys.stdout.flush()
                     from musubi_tuner.utils.device_utils import synchronize_device
                     synchronize_device(accelerator.device)  # Ensure GPU is ready
                     
@@ -2365,12 +2373,14 @@ class NetworkTrainer:
                     noise = noise_cpu.to(device=accelerator.device, dtype=latents.dtype)
                     synchronize_device(accelerator.device)
                     
-                    logger.info(f"Step {step}: Noise generated: {noise.shape}, device: {noise.device}")
-                    sys.stdout.flush()
+                    if args.debug:
+                        logger.info(f"Step {step}: Noise generated: {noise.shape}, device: {noise.device}")
+                        sys.stdout.flush()
 
                     # calculate model input and timesteps
-                    logger.info(f"Step {step}: Computing noisy model input and timesteps...")
-                    sys.stdout.flush()
+                    if args.debug:
+                        logger.info(f"Step {step}: Computing noisy model input and timesteps...")
+                        sys.stdout.flush()
                     from musubi_tuner.utils.device_utils import synchronize_device
                     synchronize_device(accelerator.device)  # Ensure GPU is ready before random operations
                     try:
@@ -2378,8 +2388,9 @@ class NetworkTrainer:
                             args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
                         )
                         synchronize_device(accelerator.device)
-                        logger.info(f"Step {step}: Noisy input: {noisy_model_input.shape}, timesteps: {timesteps.shape}")
-                        sys.stdout.flush()
+                        if args.debug:
+                            logger.info(f"Step {step}: Noisy input: {noisy_model_input.shape}, timesteps: {timesteps.shape}")
+                            sys.stdout.flush()
                     except Exception as e:
                         logger.error(f"Step {step}: Error in get_noisy_model_input_and_timesteps: {e}", exc_info=True)
                         sys.stdout.flush()
@@ -2720,6 +2731,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="specify WandB API key to log in before starting training (optional). / WandB APIキーを指定して学習開始前にログインする（オプション）",
     )
     parser.add_argument("--log_config", action="store_true", help="log training configuration / 学習設定をログに出力する")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="enable debug logging (verbose step-by-step output) / デバッグログを有効にする（詳細なステップごとの出力）",
+    )
 
     parser.add_argument(
         "--ddp_timeout",
