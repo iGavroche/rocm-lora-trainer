@@ -246,7 +246,8 @@ class ZImageNetworkTrainer(NetworkTrainer):
         model: ZImageTransformer2DModel = transformer
 
         bsize = latents.shape[0]
-        latents = batch["latents"]  # B, C, 1, H, W (or B, C, H, W for images)
+        # Use latents parameter directly (already from batch, no need to re-extract)
+        # latents is already B, C, 1, H, W (or B, C, H, W for images) from the training loop
 
         # Get text embeddings (caption features)
         vl_embed = batch["vl_embed"]  # list of (L, D) or tensor

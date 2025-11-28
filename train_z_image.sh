@@ -47,13 +47,14 @@ OUTPUT_NAME="z_image_lora"
 MODEL_PATH="models/z-image"  # Local model directory, or use "Tongyi-MAI/Z-Image-Turbo" for HuggingFace
 # Alternative: MODEL_PATH="Tongyi-MAI/Z-Image-Turbo"
 
-# Safe training parameters - optimized for ROCm stability
-MAX_EPOCHS=1                # Reduced epochs for faster iteration
-LEARNING_RATE=2e-4          # Standard learning rate
-NETWORK_DIM=16              # Standard rank
-NETWORK_ALPHA=24            # Standard alpha
+# Quality-focused training parameters (prevents blotchy output)
+# For better quality, use more epochs, lower LR, higher rank
+MAX_EPOCHS=6                # More epochs for better convergence (prevents blotchiness)
+LEARNING_RATE=1e-4          # Lower LR for smoother training (2e-4 can cause artifacts)
+NETWORK_DIM=32              # Higher rank captures more detail (16 is too low for quality)
+NETWORK_ALPHA=32            # Alpha = rank for balanced training (prevents overfitting)
 BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=4  # Standard accumulation (effective batch size = 4)
+GRADIENT_ACCUMULATION_STEPS=8  # Higher accumulation = more stable gradients (reduces blotchiness)
 GUIDANCE_SCALE=0.0          # Z-Image-Turbo uses 0.0 (no CFG)
 
 # Mixed precision - must match Z-Image weights (bfloat16)
@@ -86,9 +87,11 @@ echo "Dataset: $DATASET_CONFIG"
 echo "Output: $OUTPUT_DIR/$OUTPUT_NAME"
 echo "Model: $MODEL_PATH"
 echo ""
-echo "Speed optimizations enabled:"
-echo "  - Reduced epochs: $MAX_EPOCHS (faster iteration)"
-echo "  - Reduced gradient accumulation: $GRADIENT_ACCUMULATION_STEPS (faster visible progress)"
+echo "Quality-focused settings (prevents blotchy output):"
+echo "  - Epochs: $MAX_EPOCHS (more epochs = better convergence)"
+echo "  - Learning rate: $LEARNING_RATE (lower LR = smoother training, less artifacts)"
+echo "  - Network rank: $NETWORK_DIM (higher rank = more detail capture)"
+echo "  - Gradient accumulation: $GRADIENT_ACCUMULATION_STEPS (more stable gradients)"
 echo "  - Data loader workers: $DATA_LOADER_WORKERS (disabled to prevent SIGSEGV on ROCm/Strix Halo)"
 echo "  - Persistent workers: disabled (causes SIGSEGV with older accelerate on ROCm)"
 echo "  - Save frequency: every $SAVE_EVERY_N_EPOCHS epochs"
@@ -153,7 +156,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision "$MIXED_PREC
     $([ "$USE_PINNED_MEMORY_FOR_BLOCK_SWAP" = "true" ] && echo "--use_pinned_memory_for_block_swap") \
     $([ "$VAE_CACHE_CPU" = "true" ] && echo "--vae_cache_cpu") \
     --timestep_sampling shift \
-    --discrete_flow_shift 5.0 \
+    --discrete_flow_shift 3.0 \
     --min_timestep 0 \
     --max_timestep 900 \
     --preserve_distribution_shape \
