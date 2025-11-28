@@ -78,7 +78,7 @@ if x.device.type == "cuda":
 
 ## Environment Variables
 
-Required ROCm environment variables (see `train_chani_full.sh`):
+Required ROCm environment variables (see `train_wan22_14B_i2v_full.sh`):
 - `HSA_XNACK=0` - Disable XNACK for RDNA3.5 stability
 - `HSA_ENABLE_SDMA=0` - Disable SDMA to fix allocation faults
 - `PYTORCH_ROCM_ARCH=gfx1151` - Set GPU architecture
